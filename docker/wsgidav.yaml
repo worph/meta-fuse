@@ -1,0 +1,52 @@
+# WsgiDAV Configuration for meta-fuse Virtual Filesystem
+
+host: 0.0.0.0
+port: 8080
+
+# Simple user authentication
+simple_dc:
+  user_mapping:
+    "/":
+      metamesh:
+        password: metamesh
+        roles: ["editor"]
+    "/webdav":
+      metamesh:
+        password: metamesh
+        roles: ["editor"]
+
+# Mount the virtual filesystem
+provider_mapping:
+  "/webdav":
+    root: /mnt/virtual
+    readonly: true
+
+# Logging
+verbose: 1
+logging:
+  enable_loggers: []
+
+# Server configuration
+server: cheroot
+server_args:
+  numthreads: 10
+
+# Authentication settings
+accept_basic: true
+accept_digest: false
+default_to_digest: false
+
+# HTTP configuration
+add_header_MS_Author_Via: false
+
+# Hotfixes for path encoding
+hotfixes:
+  unquote_path_info: false
+
+# Directory browsing
+dir_browser:
+  enable: true
+  response_trailer: ""
+  davmount: false
+  ms_sharepoint_support: false
+  ms_sharepoint_urls: false

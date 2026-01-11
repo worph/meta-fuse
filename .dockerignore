@@ -1,0 +1,25 @@
+# Dependencies
+node_modules
+**/node_modules
+**/.pnpm-store
+
+# Build outputs
+dist
+**/dist
+
+# Development files
+.git
+.gitignore
+*.md
+.env*
+.vscode
+.idea
+
+# Test files
+**/*.test.ts
+**/*.spec.ts
+coverage
+
+# OS files
+.DS_Store
+Thumbs.db

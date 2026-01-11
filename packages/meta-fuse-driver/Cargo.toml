@@ -1,0 +1,19 @@
+[package]
+name = "meta-fuse-driver"
+version = "1.0.0"
+edition = "2021"
+description = "Rust FUSE driver for meta-fuse virtual filesystem"
+
+[dependencies]
+fuser = "0.14"
+libc = "0.2"
+env_logger = "0.11"
+reqwest = { version = "0.12", features = ["blocking", "json"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+log = "0.4"
+base64 = "0.22"
+
+[[bin]]
+name = "meta-fuse-driver"
+path = "src/main.rs"

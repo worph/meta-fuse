@@ -1,0 +1,37 @@
+version: '3.8'
+
+services:
+  meta-fuse:
+    build: .
+    container_name: meta-fuse
+    restart: unless-stopped
+    privileged: true
+    cap_add:
+      - SYS_ADMIN
+    devices:
+      - /dev/fuse
+    ports:
+      - "80:80"
+    volumes:
+      # Shared data volume (read-only for meta-fuse)
+      - ${DATA_PATH:-./data}:/data:ro
+      # Redis data (needs write access)
+      - meta-fuse-redis:/data/redis
+    environment:
+      - NODE_ENV=production
+      - REDIS_URL=redis://127.0.0.1:6379
+      - REDIS_PREFIX=meta-sort:
+      - API_HOST=0.0.0.0
+      - API_PORT=3000
+      - PUID=${PUID:-1000}
+      - PGID=${PGID:-1000}
+      - VFS_REFRESH_INTERVAL=${VFS_REFRESH_INTERVAL:-30000}
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+
+volumes:
+  meta-fuse-redis:

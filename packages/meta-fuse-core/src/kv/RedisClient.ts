@@ -1,0 +1,511 @@
+/**
+ * Redis Client for meta-fuse
+ * Reads metadata from Redis (written by meta-sort)
+ *
+ * Key features:
+ * - FILES_VOLUME path resolution (prepends /files/ to relative paths)
+ * - Parses meta-sort hash format into structured metadata
+ * - Redis pub/sub support for real-time updates
+ */
+
+import { Redis } from 'ioredis';
+import { Logger } from 'tslog';
+import type { IKVClient, KeyValuePair } from './IKVClient.js';
+
+const logger = new Logger({ name: 'RedisClient' });
+
+/**
+ * Full metadata structure including fields needed for virtual path computation
+ */
+export interface FileMetadata {
+    // Path information
+    sourcePath: string;      // Full path: /files/media1/Movies/...
+    originalPath: string;    // Relative path from meta-sort: media1/Movies/...
+
+    // File stats
+    size: number;
+    mtime: number;
+    ctime: number;
+
+    // Identification
+    hashId?: string;         // midhash256 hash ID
+
+    // Title information (for folder organization)
+    title?: string;
+    titles?: { eng?: string; [key: string]: string | undefined };
+    originalTitle?: string;
+    fileName?: string;
+
+    // Series metadata
+    season?: number;
+    episode?: number;
+    extra?: boolean;
+
+    // Movie metadata
+    movieYear?: number;
+    year?: number;
+
+    // File type
+    fileType?: string;       // 'video', 'subtitle', 'torrent', etc.
+    extension?: string;
+
+    // Version/variant info
+    version?: string;
+    subtitleLanguage?: string;
+
+    // Generic metadata container
+    [key: string]: unknown;
+}
+
+export interface RedisClientConfig {
+    url?: string;
+    prefix?: string;
+    filesVolume?: string;
+    reconnectInterval?: number;
+}
+
+export class RedisClient implements Partial<IKVClient> {
+    private client: Redis | null = null;
+    private subscriber: Redis | null = null;
+    private config: Required<RedisClientConfig>;
+    private isConnected = false;
+    private reconnectTimer: NodeJS.Timeout | null = null;
+    private subscriptions: Map<string, (message: string) => void> = new Map();
+
+    constructor(config: RedisClientConfig = {}) {
+        this.config = {
+            url: config.url ?? process.env.REDIS_URL ?? 'redis://127.0.0.1:6379',
+            prefix: config.prefix ?? process.env.REDIS_PREFIX ?? 'meta-sort:',
+            filesVolume: config.filesVolume ?? process.env.FILES_VOLUME ?? '/files',
+            reconnectInterval: config.reconnectInterval ?? 5000,
+        };
+    }
+
+    /**
+     * Connect to Redis
+     */
+    async connect(): Promise<void> {
+        if (this.client && this.isConnected) {
+            return;
+        }
+
+        try {
+            this.client = new Redis(this.config.url, {
+                retryStrategy: (times: number) => {
+                    if (times > 10) {
+                        logger.warn('Max reconnection attempts reached');
+                        return null;
+                    }
+                    return Math.min(times * 500, 5000);
+                },
+                maxRetriesPerRequest: 3,
+            });
+
+            this.client.on('connect', () => {
+                logger.info('Connected to Redis');
+                this.isConnected = true;
+            });
+
+            this.client.on('error', (err: Error) => {
+                logger.error('Redis error:', err.message);
+                this.isConnected = false;
+            });
+
+            this.client.on('close', () => {
+                logger.warn('Redis connection closed');
+                this.isConnected = false;
+                this.scheduleReconnect();
+            });
+
+            // Wait for connection
+            await new Promise<void>((resolve, reject) => {
+                const timeout = setTimeout(() => {
+                    reject(new Error('Redis connection timeout'));
+                }, 10000);
+
+                this.client!.once('ready', () => {
+                    clearTimeout(timeout);
+                    this.isConnected = true;
+                    resolve();
+                });
+
+                this.client!.once('error', (err: Error) => {
+                    clearTimeout(timeout);
+                    reject(err);
+                });
+            });
+        } catch (error) {
+            logger.error('Failed to connect to Redis:', error);
+            this.scheduleReconnect();
+            throw error;
+        }
+    }
+
+    /**
+     * Schedule reconnection attempt
+     */
+    private scheduleReconnect(): void {
+        if (this.reconnectTimer) {
+            return;
+        }
+
+        this.reconnectTimer = setTimeout(async () => {
+            this.reconnectTimer = null;
+            try {
+                await this.connect();
+            } catch {
+                // Will retry via scheduleReconnect
+            }
+        }, this.config.reconnectInterval);
+    }
+
+    /**
+     * Disconnect from Redis
+     */
+    async disconnect(): Promise<void> {
+        if (this.reconnectTimer) {
+            clearTimeout(this.reconnectTimer);
+            this.reconnectTimer = null;
+        }
+
+        if (this.subscriber) {
+            await this.subscriber.quit();
+            this.subscriber = null;
+        }
+
+        if (this.client) {
+            await this.client.quit();
+            this.client = null;
+            this.isConnected = false;
+        }
+
+        this.subscriptions.clear();
+    }
+
+    /**
+     * Check if connected
+     */
+    get connected(): boolean {
+        return this.isConnected;
+    }
+
+    /**
+     * Get all file metadata from Redis
+     */
+    async getAllFiles(): Promise<Map<string, FileMetadata>> {
+        const files = new Map<string, FileMetadata>();
+
+        if (!this.client || !this.isConnected) {
+            logger.warn('Redis not connected, returning empty file list');
+            return files;
+        }
+
+        try {
+            // Get all file keys using the index
+            const indexKey = `${this.config.prefix}file:__index__`;
+            const hashIds = await this.client.smembers(indexKey);
+
+            if (hashIds.length === 0) {
+                // Fallback: scan for file keys directly
+                const pattern = `${this.config.prefix}file:*`;
+                const keys = await this.scanKeys(pattern);
+                logger.debug(`Found ${keys.length} file keys in Redis (via scan)`);
+
+                for (const key of keys) {
+                    if (key.includes('__index__')) continue;
+
+                    try {
+                        const data = await this.client.hgetall(key);
+                        if (data && Object.keys(data).length > 0) {
+                            const hashId = key.replace(`${this.config.prefix}file:`, '');
+                            const metadata = this.parseMetadata(data, hashId);
+                            files.set(metadata.sourcePath, metadata);
+                        }
+                    } catch (err) {
+                        logger.warn(`Failed to get metadata for key ${key}:`, err);
+                    }
+                }
+            } else {
+                logger.debug(`Found ${hashIds.length} files in index`);
+
+                // Fetch metadata for each hash ID
+                for (const hashId of hashIds) {
+                    try {
+                        const key = `${this.config.prefix}file:${hashId}`;
+                        const data = await this.client.hgetall(key);
+                        if (data && Object.keys(data).length > 0) {
+                            const metadata = this.parseMetadata(data, hashId);
+                            files.set(metadata.sourcePath, metadata);
+                        }
+                    } catch (err) {
+                        logger.warn(`Failed to get metadata for hashId ${hashId}:`, err);
+                    }
+                }
+            }
+
+            logger.info(`Loaded ${files.size} files from Redis`);
+        } catch (error) {
+            logger.error('Failed to get files from Redis:', error);
+        }
+
+        return files;
+    }
+
+    /**
+     * Get file metadata by hash ID
+     */
+    async getFileByHashId(hashId: string): Promise<FileMetadata | null> {
+        if (!this.client || !this.isConnected) {
+            return null;
+        }
+
+        try {
+            const key = `${this.config.prefix}file:${hashId}`;
+            const data = await this.client.hgetall(key);
+
+            if (data && Object.keys(data).length > 0) {
+                return this.parseMetadata(data, hashId);
+            }
+
+            return null;
+        } catch (error) {
+            logger.error(`Failed to get file ${hashId}:`, error);
+            return null;
+        }
+    }
+
+    /**
+     * Get all hash IDs from Redis index
+     */
+    async getAllHashIds(): Promise<string[]> {
+        if (!this.client || !this.isConnected) {
+            return [];
+        }
+
+        try {
+            const indexKey = `${this.config.prefix}file:__index__`;
+            return await this.client.smembers(indexKey);
+        } catch (error) {
+            logger.error('Failed to get hash IDs:', error);
+            return [];
+        }
+    }
+
+    /**
+     * Scan Redis keys matching pattern
+     */
+    private async scanKeys(pattern: string): Promise<string[]> {
+        if (!this.client) return [];
+
+        const keys: string[] = [];
+        let cursor = '0';
+
+        do {
+            const [newCursor, batch] = await this.client.scan(cursor, 'MATCH', pattern, 'COUNT', 1000);
+            cursor = newCursor;
+            keys.push(...batch);
+        } while (cursor !== '0');
+
+        return keys;
+    }
+
+    /**
+     * Parse metadata from Redis hash
+     * Handles meta-sort format and resolves paths with FILES_VOLUME
+     */
+    private parseMetadata(data: Record<string, string>, hashId?: string): FileMetadata {
+        // Get the original path (relative to FILES_VOLUME)
+        const originalPath = data.filePath ?? data.sourcePath ?? '';
+
+        // Resolve full source path by prepending FILES_VOLUME
+        let sourcePath = originalPath;
+        if (originalPath && !originalPath.startsWith('/')) {
+            // Relative path - prepend FILES_VOLUME
+            sourcePath = `${this.config.filesVolume}/${originalPath}`;
+        } else if (!originalPath.startsWith(this.config.filesVolume) && originalPath.startsWith('/')) {
+            // Absolute path but not in FILES_VOLUME - still prepend
+            sourcePath = `${this.config.filesVolume}${originalPath}`;
+        }
+
+        // Parse size
+        const size = parseInt(data.fileSize ?? data.size ?? data.sizeByte ?? '0', 10);
+
+        // Parse timestamps
+        let mtime = 0;
+        if (data.mtime) {
+            const parsed = Date.parse(data.mtime);
+            mtime = isNaN(parsed) ? parseFloat(data.mtime) : parsed;
+        }
+
+        // Parse titles - can be nested object or simple string
+        let titles: { eng?: string; [key: string]: string | undefined } | undefined;
+        if (data['titles/eng']) {
+            titles = { eng: data['titles/eng'] };
+        }
+
+        // Parse season/episode (can be 0 for specials)
+        const season = data.season !== undefined ? parseInt(data.season, 10) : undefined;
+        const episode = data.episode !== undefined ? parseInt(data.episode, 10) : undefined;
+
+        // Parse year
+        const movieYear = data.movieYear ? parseInt(data.movieYear, 10) : undefined;
+        const year = data.year ? parseInt(data.year, 10) : movieYear;
+
+        return {
+            // Path information
+            sourcePath,
+            originalPath,
+
+            // File stats
+            size,
+            mtime,
+            ctime: data.ctime ? parseFloat(data.ctime) : mtime,
+
+            // Identification
+            hashId: hashId ?? data.cid_midhash256 ?? data.hashId,
+
+            // Title information
+            title: data.title,
+            titles,
+            originalTitle: data.originalTitle,
+            fileName: data.fileName,
+
+            // Series metadata
+            season,
+            episode,
+            extra: data.extra === 'true',
+
+            // Movie metadata
+            movieYear,
+            year,
+
+            // File type
+            fileType: data.fileType,
+            extension: data.extension,
+
+            // Version/variant
+            version: data.version,
+            subtitleLanguage: data.subtitleLanguage,
+        };
+    }
+
+    /**
+     * Subscribe to Redis pub/sub channel
+     */
+    async subscribe(channel: string, callback: (message: string) => void): Promise<void> {
+        if (!this.client) {
+            throw new Error('Redis not connected');
+        }
+
+        // Create subscriber connection if not exists
+        if (!this.subscriber) {
+            this.subscriber = this.client.duplicate();
+            await new Promise<void>((resolve, reject) => {
+                const timeout = setTimeout(() => reject(new Error('Subscriber connection timeout')), 10000);
+                this.subscriber!.once('ready', () => {
+                    clearTimeout(timeout);
+                    resolve();
+                });
+                this.subscriber!.once('error', (err) => {
+                    clearTimeout(timeout);
+                    reject(err);
+                });
+            });
+
+            // Set up message handler
+            this.subscriber.on('message', (ch: string, message: string) => {
+                const handler = this.subscriptions.get(ch);
+                if (handler) {
+                    try {
+                        handler(message);
+                    } catch (error: any) {
+                        logger.error(`Error in subscription handler for ${ch}:`, error.message);
+                    }
+                }
+            });
+        }
+
+        // Store callback and subscribe
+        this.subscriptions.set(channel, callback);
+        await this.subscriber.subscribe(channel);
+        logger.info(`Subscribed to channel: ${channel}`);
+    }
+
+    /**
+     * Unsubscribe from Redis pub/sub channel
+     */
+    async unsubscribe(channel: string): Promise<void> {
+        if (this.subscriber) {
+            await this.subscriber.unsubscribe(channel);
+            this.subscriptions.delete(channel);
+            logger.info(`Unsubscribed from channel: ${channel}`);
+        }
+    }
+
+    /**
+     * Get stats about Redis data
+     */
+    async getStats(): Promise<{ totalKeys: number; fileCount: number; connected: boolean }> {
+        if (!this.client || !this.isConnected) {
+            return { totalKeys: 0, fileCount: 0, connected: false };
+        }
+
+        try {
+            // Try index first
+            const indexKey = `${this.config.prefix}file:__index__`;
+            const count = await this.client.scard(indexKey);
+
+            if (count > 0) {
+                return {
+                    totalKeys: count,
+                    fileCount: count,
+                    connected: true,
+                };
+            }
+
+            // Fallback to scanning
+            const filePattern = `${this.config.prefix}file:*`;
+            const fileKeys = await this.scanKeys(filePattern);
+            const actualFileKeys = fileKeys.filter(k => !k.includes('__index__'));
+
+            return {
+                totalKeys: actualFileKeys.length,
+                fileCount: actualFileKeys.length,
+                connected: true,
+            };
+        } catch {
+            return { totalKeys: 0, fileCount: 0, connected: false };
+        }
+    }
+
+    /**
+     * Health check
+     */
+    async health(): Promise<boolean> {
+        if (!this.client || !this.isConnected) {
+            return false;
+        }
+
+        try {
+            const result = await this.client.ping();
+            return result === 'PONG';
+        } catch {
+            return false;
+        }
+    }
+
+    /**
+     * Close connections
+     */
+    async close(): Promise<void> {
+        await this.disconnect();
+    }
+
+    /**
+     * Get the raw ioredis client for direct access if needed
+     * Use with caution - prefer using the typed methods above
+     */
+    getRawClient(): Redis | null {
+        return this.client;
+    }
+}
