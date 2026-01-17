@@ -31,6 +31,7 @@ export interface FileAttributes {
 
 export interface ReadResult {
     sourcePath: string | null;
+    webdavUrl: string | null;
     content: Buffer | null;
     size: number;
 }
@@ -54,6 +55,8 @@ export interface VFSConfig {
     gid?: number;
     refreshInterval?: number;
     configDir?: string;  // Directory for config files (renaming rules, etc.)
+    webdavBaseUrl?: string | null;  // meta-sort WebDAV URL for file access (e.g., http://meta-sort-dev/webdav)
+    filesPath?: string;  // Local files path prefix to strip when building WebDAV URLs
 }
 
 export class VirtualFileSystem {
@@ -92,6 +95,8 @@ export class VirtualFileSystem {
             gid: config.gid ?? 1000,
             refreshInterval: config.refreshInterval ?? 30000, // 30 seconds
             configDir,
+            webdavBaseUrl: config.webdavBaseUrl ?? null,
+            filesPath: config.filesPath ?? '/files',
         };
 
         // Initialize root directory
@@ -517,7 +522,7 @@ export class VirtualFileSystem {
     }
 
     /**
-     * Read file (returns source path for actual reading)
+     * Read file (returns source path and/or WebDAV URL for actual reading)
      */
     read(filepath: string): ReadResult | null {
         filepath = this.normalizePath(filepath);
@@ -527,8 +532,30 @@ export class VirtualFileSystem {
             return null;
         }
 
+        // Compute WebDAV URL if configured
+        let webdavUrl: string | null = null;
+        if (this.config.webdavBaseUrl && node.sourcePath) {
+            // Convert sourcePath (e.g., /files/watch/movie.mkv) to WebDAV URL
+            // Strip filesPath prefix and append to webdavBaseUrl
+            let relativePath = node.sourcePath;
+            const filesPath = this.config.filesPath;
+            if (relativePath.startsWith(filesPath + '/')) {
+                relativePath = relativePath.substring(filesPath.length);
+            } else if (relativePath.startsWith(filesPath)) {
+                relativePath = relativePath.substring(filesPath.length);
+            }
+            // Ensure path starts with /
+            if (!relativePath.startsWith('/')) {
+                relativePath = '/' + relativePath;
+            }
+            // URL-encode the path components (but not the slashes)
+            const encodedPath = relativePath.split('/').map(encodeURIComponent).join('/');
+            webdavUrl = this.config.webdavBaseUrl.replace(/\/$/, '') + encodedPath;
+        }
+
         return {
             sourcePath: node.sourcePath!,
+            webdavUrl,
             content: null,
             size: node.size!,
         };

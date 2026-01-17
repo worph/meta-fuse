@@ -205,11 +205,16 @@ export class APIServer {
       return;
     }
 
-    // Return source path for FUSE driver to read from
+    // Return source path and/or WebDAV URL for FUSE driver to read from
     const response: Record<string, unknown> = {
       sourcePath: result.sourcePath,
       size: result.size,
     };
+
+    // Include WebDAV URL if available (for remote file access)
+    if (result.webdavUrl) {
+      response.webdavUrl = result.webdavUrl;
+    }
 
     // If content is provided (virtual file), encode as base64
     if (result.content !== null) {

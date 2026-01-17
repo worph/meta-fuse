@@ -24,6 +24,8 @@ pub struct FileAttributes {
 pub struct ReadResult {
     #[serde(rename = "sourcePath")]
     pub source_path: Option<String>,
+    #[serde(rename = "webdavUrl")]
+    pub webdav_url: Option<String>,
     pub content: Option<String>,
     #[serde(rename = "contentEncoding")]
     pub content_encoding: Option<String>,

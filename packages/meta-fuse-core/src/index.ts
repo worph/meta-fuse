@@ -40,9 +40,16 @@ async function main(): Promise<void> {
         vfsRefreshInterval: parseInt(process.env.VFS_REFRESH_INTERVAL ?? '30000', 10),
         baseUrl: process.env.BASE_URL,
         serviceVersion: process.env.SERVICE_VERSION ?? '1.0.0',
+        // WebDAV URL for meta-sort file access (e.g., http://meta-sort-dev/webdav)
+        metaSortWebdavUrl: process.env.META_SORT_WEBDAV_URL,
     };
 
     logger.info(`Config: META_CORE_PATH=${config.metaCorePath}, FILES_VOLUME=${config.filesPath}`);
+    if (config.metaSortWebdavUrl) {
+        logger.info(`WebDAV: Using meta-sort WebDAV at ${config.metaSortWebdavUrl}`);
+    } else {
+        logger.info(`WebDAV: Not configured, FUSE driver will use local filesystem`);
+    }
 
     // Initialize KV Manager (handles leader discovery)
     const kvManager = new KVManager({
@@ -101,6 +108,8 @@ async function main(): Promise<void> {
                 gid: parseInt(process.env.PGID ?? '1000', 10),
                 refreshInterval: config.vfsRefreshInterval,
                 configDir: process.env.CONFIG_DIR ?? '/meta-fuse/config',
+                webdavBaseUrl: config.metaSortWebdavUrl,
+                filesPath: config.filesPath,
             });
 
             // Start VFS

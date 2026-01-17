@@ -9,8 +9,9 @@ Meta-Fuse is a read-only process in the MetaMesh ecosystem that:
 1. **Connects to shared KV storage** - Reads metadata from Redis/compatible KV database managed by meta-sort
 2. **Mounts virtual filesystem** - Rust-based FUSE driver creates an organized view of media files
 3. **Serves WebDAV** - Network-accessible file sharing for Windows/Mac/Linux clients
-4. **Zero file duplication** - All content points to original files in the shared DATA volume
+4. **Zero file duplication** - All content points to original files via WebDAV or direct volume access
 5. **Leader-aware KV access** - Discovers and connects to the active KV database via lock file
+6. **WebDAV file access** - Can read files from meta-sort's WebDAV server (supports SMB/rclone mounts)
 
 ## Architecture
 
@@ -235,11 +236,15 @@ FUSE_ALLOW_OTHER=true                               # Allow other users
 PUID=1000                                           # User ID for files
 PGID=1000                                           # Group ID for files
 
-# WebDAV
+# WebDAV (serving files to clients)
 WEBDAV_PORT=8080                                    # WebDAV server port
 WEBDAV_USERNAME=metamesh                            # WebDAV username
 WEBDAV_PASSWORD=metamesh                            # WebDAV password
 WEBDAV_READONLY=true                                # Read-only mode
+
+# meta-sort WebDAV Access (reading files from meta-sort)
+META_SORT_WEBDAV_URL=http://meta-sort-dev/webdav    # URL to access files via meta-sort's WebDAV
+                                                    # Enables access to SMB/rclone mounts
 ```
 
 ### Docker Compose
@@ -271,6 +276,8 @@ services:
       - FILES_VOLUME=/files
       - FUSE_MOUNT_POINT=/mnt/virtual
       - REDIS_PREFIX=meta-sort:
+      # Optional: Read files via meta-sort WebDAV (enables SMB/rclone mount access)
+      - META_SORT_WEBDAV_URL=http://meta-sort/webdav
 ```
 
 ## API Endpoints

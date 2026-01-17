@@ -284,6 +284,7 @@ impl ApiFS {
         offset: usize,
         size: usize,
     ) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+        // Priority 1: Inline base64 content (for virtual files)
         if let Some(ref content_b64) = read_result.content {
             let content = base64::prelude::BASE64_STANDARD.decode(content_b64)?;
             let end = std::cmp::min(offset + size, content.len());
@@ -293,6 +294,12 @@ impl ApiFS {
             return Ok(content[offset..end].to_vec());
         }
 
+        // Priority 2: WebDAV URL (remote file access via HTTP Range requests)
+        if let Some(ref webdav_url) = read_result.webdav_url {
+            return self.read_from_webdav(webdav_url, offset, size, read_result.size);
+        }
+
+        // Priority 3: Local filesystem (fallback)
         if let Some(ref source_path) = read_result.source_path {
             let mut file = File::open(source_path)?;
 
@@ -308,7 +315,44 @@ impl ApiFS {
             return Ok(buffer);
         }
 
-        Err("No content or source path available".into())
+        Err("No content, WebDAV URL, or source path available".into())
+    }
+
+    /// Read file content from WebDAV URL using HTTP Range requests
+    fn read_from_webdav(
+        &self,
+        webdav_url: &str,
+        offset: usize,
+        size: usize,
+        file_size: u64,
+    ) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+        // Don't request beyond the end of the file
+        if offset as u64 >= file_size {
+            return Ok(vec![]);
+        }
+
+        // Calculate the actual range to request
+        let end = std::cmp::min(offset as u64 + size as u64 - 1, file_size - 1);
+        let range_header = format!("bytes={}-{}", offset, end);
+
+        debug!("WebDAV read: {} Range: {}", webdav_url, range_header);
+
+        // Create a new HTTP client for WebDAV requests (separate from API client)
+        let client = reqwest::blocking::Client::builder()
+            .timeout(std::time::Duration::from_secs(60))
+            .build()?;
+
+        let response = client
+            .get(webdav_url)
+            .header("Range", range_header)
+            .send()?;
+
+        if response.status().is_success() || response.status() == reqwest::StatusCode::PARTIAL_CONTENT {
+            let bytes = response.bytes()?;
+            Ok(bytes.to_vec())
+        } else {
+            Err(format!("WebDAV request failed: {} - {}", response.status(), webdav_url).into())
+        }
     }
 }
 
