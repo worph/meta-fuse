@@ -51,7 +51,7 @@ async function main(): Promise<void> {
         metaCorePath: process.env.META_CORE_PATH ?? '/meta-core',
         filesPath: process.env.FILES_VOLUME ?? '/files',
         redisUrl: process.env.REDIS_URL,
-        redisPrefix: process.env.REDIS_PREFIX ?? 'meta-sort:',
+        redisPrefix: process.env.REDIS_PREFIX ?? '',
         apiPort: parseInt(process.env.API_PORT ?? '3000', 10),
         apiHost: process.env.API_HOST ?? '0.0.0.0',
         vfsRefreshInterval: parseInt(process.env.VFS_REFRESH_INTERVAL ?? '30000', 10),

@@ -75,7 +75,7 @@ export class RedisClient implements Partial<IKVClient> {
     constructor(config: RedisClientConfig = {}) {
         this.config = {
             url: config.url ?? process.env.REDIS_URL ?? 'redis://127.0.0.1:6379',
-            prefix: config.prefix ?? process.env.REDIS_PREFIX ?? 'meta-sort:',
+            prefix: config.prefix ?? process.env.REDIS_PREFIX ?? '',
             filesVolume: config.filesVolume ?? process.env.FILES_VOLUME ?? '/files',
             reconnectInterval: config.reconnectInterval ?? 5000,
         };
