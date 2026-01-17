@@ -17,6 +17,23 @@ const logger = new Logger({ name: 'meta-fuse' });
 // Pub/sub channel for batched updates from meta-sort
 const UPDATE_CHANNEL = 'meta-sort:file:batch';
 
+// Pub/sub channel for scan reset notification from meta-sort
+const RESET_CHANNEL = 'meta-sort:scan:reset';
+
+// Pub/sub channel for plugin completion events from meta-sort
+const PLUGIN_COMPLETE_CHANNEL = 'meta-sort:plugin:complete';
+
+// Plugins that provide metadata needed for VFS virtual paths
+// When these complete, we should update the VFS entry for that file
+const VFS_RELEVANT_PLUGINS = new Set(['filename-parser', 'tmdb', 'jellyfin-nfo']);
+
+interface PluginCompleteMessage {
+    fileHash: string;
+    pluginId: string;
+    filePath: string;
+    timestamp: number;
+}
+
 interface BatchUpdateMessage {
     timestamp: number;
     changes: Array<{
@@ -129,6 +146,39 @@ async function main(): Promise<void> {
                     }
                 } catch (error: any) {
                     logger.error(`Error processing batch update: ${error.message}`);
+                }
+            });
+
+            // Subscribe to scan reset events from meta-sort
+            logger.info(`Subscribing to ${RESET_CHANNEL}...`);
+            await redisClient.subscribe(RESET_CHANNEL, async (message: string) => {
+                try {
+                    const event = JSON.parse(message);
+                    logger.info(`Received scan reset event: ${event.action}`);
+
+                    // Reset VFS for fresh scan - will be rebuilt incrementally
+                    vfs!.reset();
+
+                    logger.info('VFS reset complete, awaiting new file updates from meta-sort');
+                } catch (error: any) {
+                    logger.error(`Error processing reset event: ${error.message}`);
+                }
+            });
+
+            // Subscribe to plugin completion events from meta-sort
+            // When relevant plugins complete (filename-parser, tmdb, etc.), update VFS
+            logger.info(`Subscribing to ${PLUGIN_COMPLETE_CHANNEL}...`);
+            await redisClient.subscribe(PLUGIN_COMPLETE_CHANNEL, async (message: string) => {
+                try {
+                    const event: PluginCompleteMessage = JSON.parse(message);
+
+                    // Only process plugins that provide VFS-relevant metadata
+                    if (VFS_RELEVANT_PLUGINS.has(event.pluginId)) {
+                        logger.debug(`Plugin ${event.pluginId} completed for ${event.fileHash}, updating VFS`);
+                        await vfs!.onFileUpdate(event.fileHash, 'update');
+                    }
+                } catch (error: any) {
+                    logger.error(`Error processing plugin complete event: ${error.message}`);
                 }
             });
 
