@@ -242,8 +242,8 @@ WEBDAV_USERNAME=metamesh                            # WebDAV username
 WEBDAV_PASSWORD=metamesh                            # WebDAV password
 WEBDAV_READONLY=true                                # Read-only mode
 
-# meta-sort WebDAV Access (reading files from meta-sort)
-META_SORT_WEBDAV_URL=http://meta-sort-dev/webdav    # URL to access files via meta-sort's WebDAV
+# meta-core WebDAV Access (reading files from meta-core)
+META_CORE_WEBDAV_URL=http://meta-core/webdav        # URL to access files via meta-core's WebDAV
                                                     # Enables access to SMB/rclone mounts
 ```
 
@@ -276,8 +276,8 @@ services:
       - FILES_VOLUME=/files
       - FUSE_MOUNT_POINT=/mnt/virtual
       - REDIS_PREFIX=meta-sort:
-      # Optional: Read files via meta-sort WebDAV (enables SMB/rclone mount access)
-      - META_SORT_WEBDAV_URL=http://meta-sort/webdav
+      # Optional: Read files via meta-core WebDAV (enables SMB/rclone mount access)
+      - META_CORE_WEBDAV_URL=http://meta-core/webdav
 ```
 
 ## API Endpoints

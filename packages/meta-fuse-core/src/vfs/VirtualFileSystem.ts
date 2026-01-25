@@ -221,7 +221,7 @@ export class VirtualFileSystem {
                 // Compute virtual path using rules or fallback
                 const virtualPath = this.computeVirtualPath(metadata, sourcePath);
                 if (virtualPath) {
-                    this.addFile(virtualPath, metadata);
+                    await this.addFile(virtualPath, metadata);
                     this.sourcePathToVirtualPath.set(sourcePath, virtualPath);
                 }
             }
@@ -325,7 +325,7 @@ export class VirtualFileSystem {
         }
 
         // Add/update file
-        this.addFile(virtualPath, metadata);
+        await this.addFile(virtualPath, metadata);
         this.sourcePathToVirtualPath.set(metadata.sourcePath, virtualPath);
 
         logger.debug(`File ${action}ed: ${virtualPath}`);
@@ -334,7 +334,7 @@ export class VirtualFileSystem {
     /**
      * Add a file to the VFS
      */
-    private addFile(virtualPath: string, metadata: FileMetadata): void {
+    private async addFile(virtualPath: string, metadata: FileMetadata): Promise<void> {
         virtualPath = this.normalizePath(virtualPath);
 
         // Skip if file already exists at this path
@@ -363,8 +363,20 @@ export class VirtualFileSystem {
                 mtime = stats.mtime;
                 ctime = stats.ctime;
             } catch {
-                logger.warn(`Cannot stat source file: ${metadata.sourcePath}`);
-                return;
+                // Local stat failed, try WebDAV if configured
+                if (this.config.webdavBaseUrl) {
+                    const webdavStats = await this.statViaWebDAV(metadata.sourcePath);
+                    if (webdavStats) {
+                        size = webdavStats.size;
+                        mtime = webdavStats.mtime || mtime;
+                    } else {
+                        logger.warn(`Cannot stat source file via WebDAV: ${metadata.sourcePath}`);
+                        return;
+                    }
+                } else {
+                    logger.warn(`Cannot stat source file: ${metadata.sourcePath}`);
+                    return;
+                }
             }
         }
 
@@ -390,6 +402,49 @@ export class VirtualFileSystem {
         // Update stats
         this.cachedStats.fileCount++;
         this.cachedStats.totalSize += size;
+    }
+
+    /**
+     * Get file stats via WebDAV HEAD request
+     */
+    private async statViaWebDAV(sourcePath: string): Promise<{ size: number; mtime?: Date } | null> {
+        if (!this.config.webdavBaseUrl) {
+            return null;
+        }
+
+        try {
+            // Convert source path to WebDAV URL
+            let relativePath = sourcePath;
+            if (this.config.filesPath && sourcePath.startsWith(this.config.filesPath)) {
+                relativePath = sourcePath.slice(this.config.filesPath.length);
+            }
+            if (!relativePath.startsWith('/')) {
+                relativePath = '/' + relativePath;
+            }
+
+            // URL-encode path segments (but not slashes)
+            const encodedPath = relativePath.split('/').map(segment => encodeURIComponent(segment)).join('/');
+            const webdavUrl = this.config.webdavBaseUrl + encodedPath;
+
+            // Make HEAD request
+            const response = await fetch(webdavUrl, { method: 'HEAD' });
+
+            if (response.ok) {
+                const contentLength = response.headers.get('Content-Length');
+                const lastModified = response.headers.get('Last-Modified');
+
+                return {
+                    size: contentLength ? parseInt(contentLength, 10) : 0,
+                    mtime: lastModified ? new Date(lastModified) : undefined,
+                };
+            }
+
+            logger.debug(`WebDAV HEAD failed for ${webdavUrl}: ${response.status}`);
+            return null;
+        } catch (error: any) {
+            logger.debug(`WebDAV stat error for ${sourcePath}: ${error.message}`);
+            return null;
+        }
     }
 
     /**
