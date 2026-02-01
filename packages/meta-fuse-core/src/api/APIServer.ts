@@ -303,9 +303,11 @@ export class APIServer {
       const info = this.kvManager.getLeaderInfo();
       if (info) {
         leaderInfo = {
-          host: info.host,
-          api: info.api,
-          http: info.http,
+          hostname: info.hostname,
+          baseUrl: info.baseUrl,
+          apiUrl: info.apiUrl,
+          redisUrl: info.redisUrl,
+          webdavUrl: info.webdavUrl,
         };
       }
     }
@@ -314,7 +316,6 @@ export class APIServer {
       services,
       current: 'meta-fuse',
       leader: leaderInfo,
-      isLeader: false, // meta-fuse is never the leader
     });
   }
 

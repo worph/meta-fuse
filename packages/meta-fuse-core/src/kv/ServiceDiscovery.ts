@@ -1,11 +1,14 @@
 /**
  * Service Discovery using shared filesystem
  *
- * Each service registers itself in /meta-core/services/{service-name}.json
- * with its API endpoint, status, and heartbeat timestamp.
+ * Each service registers itself in /meta-core/services/{service-name}-{hostname}.json
+ * with its base URL, status, and heartbeat timestamp.
  *
  * Services can discover each other by reading these JSON files.
- * Stale detection: if lastHeartbeat > 60 seconds ago, service is considered dead.
+ * Stale detection: if lastHeartbeat > 60 seconds ago, service is considered stale.
+ *
+ * Note: meta-core (Go sidecar) handles actual service registration.
+ * This class is primarily used for discovering other services.
  */
 
 import { promises as fs } from 'fs';
@@ -23,20 +26,8 @@ interface ServiceDiscoveryConfig {
     /** Service name */
     serviceName: string;
 
-    /** Service version */
-    version: string;
-
-    /** HTTP API URL (can be overridden by baseUrl) */
-    apiUrl?: string;
-
-    /** Base URL for service discovery (overrides auto-detected URL) */
-    baseUrl?: string;
-
-    /** Service capabilities */
-    capabilities?: string[];
-
-    /** Named endpoints */
-    endpoints?: Record<string, string>;
+    /** Base URL for the service */
+    apiUrl: string;
 
     /** Heartbeat interval in ms (default: 30000) */
     heartbeatInterval?: number;
@@ -52,18 +43,19 @@ export class ServiceDiscovery {
     private heartbeatTimer: NodeJS.Timeout | null = null;
     private isShuttingDown = false;
     private isStarted = false;
+    private currentHostname: string;
 
     constructor(config: ServiceDiscoveryConfig) {
         this.config = {
             heartbeatInterval: 30000,
             staleThreshold: 60000,
-            capabilities: [],
-            endpoints: {},
             ...config
         };
 
+        this.currentHostname = hostname();
         this.servicesDir = `${this.config.metaCorePath}/services`;
-        this.serviceFilePath = `${this.servicesDir}/${this.config.serviceName}.json`;
+        // Use hostname-based file naming
+        this.serviceFilePath = `${this.servicesDir}/${this.config.serviceName}-${this.currentHostname}.json`;
     }
 
     /**
@@ -79,28 +71,25 @@ export class ServiceDiscovery {
     private buildServiceInfo(status: ServiceInfo['status']): ServiceInfo {
         return {
             name: this.config.serviceName,
-            version: this.config.version,
-            api: this.config.baseUrl || this.config.apiUrl || '',
+            hostname: this.currentHostname,
+            baseUrl: this.config.apiUrl,
             status,
-            pid: process.pid,
-            hostname: hostname(),
-            startedAt: new Date().toISOString(),
-            lastHeartbeat: new Date().toISOString(),
-            capabilities: this.config.capabilities || [],
-            endpoints: this.config.endpoints || {}
+            lastHeartbeat: new Date().toISOString()
         };
     }
 
     /**
      * Register this service
+     * Note: In the new architecture, meta-core handles registration.
+     * This is kept for backwards compatibility and testing.
      */
     async register(): Promise<void> {
         await this.ensureServicesDir();
 
-        const info = this.buildServiceInfo('starting');
+        const info = this.buildServiceInfo('running');
         await fs.writeFile(this.serviceFilePath, JSON.stringify(info, null, 2));
 
-        logger.info(`Registered ${this.config.serviceName}`);
+        logger.info(`Registered ${this.config.serviceName}-${this.currentHostname}`);
     }
 
     /**
@@ -135,7 +124,6 @@ export class ServiceDiscovery {
             // If file was deleted, re-register
             if (error.code === 'ENOENT') {
                 await this.register();
-                await this.updateStatus('running');
             } else {
                 logger.error('Heartbeat failed:', error);
             }
@@ -170,13 +158,22 @@ export class ServiceDiscovery {
         this.stopHeartbeat();
 
         try {
-            // Update status to stopped before removing
-            await this.updateStatus('stopped');
-
-            logger.info(`Unregistered ${this.config.serviceName}`);
-        } catch (error) {
-            logger.error('Failed to unregister:', error);
+            // Remove the service file
+            await fs.unlink(this.serviceFilePath);
+            logger.info(`Unregistered ${this.config.serviceName}-${this.currentHostname}`);
+        } catch (error: any) {
+            if (error.code !== 'ENOENT') {
+                logger.error('Failed to unregister:', error);
+            }
         }
+    }
+
+    /**
+     * Check if a service info is stale
+     */
+    private isStale(info: ServiceInfo): boolean {
+        const lastHeartbeat = new Date(info.lastHeartbeat).getTime();
+        return Date.now() - lastHeartbeat > this.config.staleThreshold!;
     }
 
     // ========================================================================
@@ -185,24 +182,48 @@ export class ServiceDiscovery {
 
     /**
      * Discover a service by name
+     * Looks for files matching pattern: {name}-*.json (hostname-based naming)
      */
     async discoverService(name: string): Promise<ServiceInfo | null> {
-        const servicePath = join(this.servicesDir, `${name}.json`);
-
         try {
-            const content = await fs.readFile(servicePath, 'utf-8');
-            const service = JSON.parse(content) as ServiceInfo;
+            // First try exact match for backward compatibility
+            const exactPath = join(this.servicesDir, `${name}.json`);
+            try {
+                const content = await fs.readFile(exactPath, 'utf-8');
+                const service = JSON.parse(content) as ServiceInfo;
 
-            // Check if service is alive (heartbeat within threshold)
-            const lastHeartbeat = new Date(service.lastHeartbeat).getTime();
-            const isAlive = Date.now() - lastHeartbeat < this.config.staleThreshold!;
+                if (this.isStale(service)) {
+                    service.status = 'stale';
+                }
 
-            if (!isAlive) {
-                logger.warn(`Service ${name} appears stale (last heartbeat: ${service.lastHeartbeat})`);
-                return null;
+                return service.status === 'running' ? service : null;
+            } catch {
+                // Try hostname-based files
             }
 
-            return service;
+            // Search for hostname-based files: name-*.json
+            const files = await fs.readdir(this.servicesDir);
+            const matchingFiles = files.filter(f =>
+                f.startsWith(`${name}-`) && f.endsWith('.json')
+            );
+
+            // Return first valid (non-stale) service
+            for (const file of matchingFiles) {
+                const filePath = join(this.servicesDir, file);
+                const content = await fs.readFile(filePath, 'utf-8');
+                const service = JSON.parse(content) as ServiceInfo;
+
+                if (this.isStale(service)) {
+                    service.status = 'stale';
+                    continue; // Skip stale services
+                }
+
+                if (service.status === 'running') {
+                    return service;
+                }
+            }
+
+            return null;
         } catch (error: any) {
             if (error.code === 'ENOENT') {
                 return null; // Service not registered
@@ -222,11 +243,18 @@ export class ServiceDiscovery {
             for (const file of files) {
                 if (!file.endsWith('.json')) continue;
 
-                const name = file.replace('.json', '');
-                const service = await this.discoverService(name);
+                const filePath = join(this.servicesDir, file);
+                try {
+                    const content = await fs.readFile(filePath, 'utf-8');
+                    const service = JSON.parse(content) as ServiceInfo;
 
-                if (service && service.status === 'running') {
+                    if (this.isStale(service)) {
+                        service.status = 'stale';
+                    }
+
                     services.push(service);
+                } catch (error) {
+                    logger.error(`Failed to read ${file}:`, error);
                 }
             }
 
@@ -247,8 +275,7 @@ export class ServiceDiscovery {
         if (!service) return false;
 
         // Try to ping the service's health endpoint
-        const healthEndpoint = service.endpoints.health || '/health';
-        const url = `${service.api}${healthEndpoint}`;
+        const url = `${service.baseUrl}/health`;
 
         try {
             const response = await fetch(url, {
@@ -266,16 +293,16 @@ export class ServiceDiscovery {
 
     /**
      * Full startup sequence
+     * Note: In the new architecture, meta-core handles registration.
      */
     async start(): Promise<void> {
         if (this.isStarted) return;
 
         await this.register();
-        await this.updateStatus('running');
         this.startHeartbeat();
         this.isStarted = true;
 
-        logger.info(`Started ${this.config.serviceName} at ${this.config.baseUrl || this.config.apiUrl}`);
+        logger.info(`Started ${this.config.serviceName} at ${this.config.apiUrl}`);
     }
 
     /**

@@ -73,12 +73,8 @@ async function main(): Promise<void> {
         metaCorePath: config.metaCorePath,
         filesPath: config.filesPath,
         serviceName: 'meta-fuse',
-        version: config.serviceVersion,
         apiPort: config.apiPort,
-        redisUrl: config.redisUrl,
-        redisPrefix: config.redisPrefix,
         baseUrl: config.baseUrl,
-        capabilities: ['read', 'vfs'],
     });
 
     let redisClient: RedisClient | null = null;

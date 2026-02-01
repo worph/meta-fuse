@@ -2,16 +2,17 @@
  * KV Manager for meta-fuse (FOLLOWER-only)
  *
  * Simplified KV manager that:
- * 1. Discovers the leader via lock file
+ * 1. Discovers the leader via LeaderClient (reads kv-leader.info)
  * 2. Creates Redis client connection
  * 3. Handles reconnection on leader failure
  *
  * Unlike meta-sort's KVManager, this version never spawns Redis -
- * it only connects as a client.
+ * it only connects as a client. Leader election is handled by meta-core.
  */
 
+import { hostname } from 'os';
 import { Logger } from 'tslog';
-import { LeaderDiscovery } from './LeaderDiscovery.js';
+import { LeaderClient } from './LeaderClient.js';
 import { ServiceDiscovery } from './ServiceDiscovery.js';
 import { RedisClient } from './RedisClient.js';
 import type { LeaderLockInfo } from './IKVClient.js';
@@ -28,9 +29,6 @@ interface KVManagerConfig {
     /** Service name (for logging) */
     serviceName?: string;
 
-    /** Service version */
-    version?: string;
-
     /** HTTP API port */
     apiPort?: number;
 
@@ -43,13 +41,13 @@ interface KVManagerConfig {
     /** Base URL for service discovery (overrides auto-detected URL) */
     baseUrl?: string;
 
-    /** Service capabilities */
-    capabilities?: string[];
+    /** meta-core API URL (e.g., http://localhost:9000) */
+    metaCoreUrl?: string;
 }
 
 export class KVManager {
     private config: Required<KVManagerConfig>;
-    private leaderDiscovery: LeaderDiscovery | null = null;
+    private leaderClient: LeaderClient | null = null;
     private serviceDiscovery: ServiceDiscovery | null = null;
     private redisClient: RedisClient | null = null;
     private isStarted = false;
@@ -62,12 +60,11 @@ export class KVManager {
     constructor(config: KVManagerConfig) {
         this.config = {
             serviceName: 'meta-fuse',
-            version: '1.0.0',
             apiPort: 3000,
             redisUrl: '',
             redisPrefix: 'meta-sort:',
             baseUrl: '',
-            capabilities: ['read', 'vfs'],
+            metaCoreUrl: '',
             ...config
         };
     }
@@ -83,24 +80,15 @@ export class KVManager {
 
         logger.info(`Starting KVManager for ${this.config.serviceName}...`);
 
-        // Initialize service discovery
-        const apiUrl = this.config.baseUrl || `http://localhost:${this.config.apiPort}`;
+        // Initialize service discovery (meta-core handles actual registration)
+        // We keep this for service discovery (reading other services)
+        const apiUrl = this.config.baseUrl || `http://${hostname()}:${this.config.apiPort}`;
         this.serviceDiscovery = new ServiceDiscovery({
             metaCorePath: this.config.metaCorePath,
             serviceName: this.config.serviceName,
-            version: this.config.version,
-            apiUrl,
-            baseUrl: this.config.baseUrl || undefined,
-            capabilities: this.config.capabilities,
-            endpoints: {
-                health: '/api/fuse/health',
-                dashboard: '/',
-                stats: '/api/fuse/stats',
-            }
+            apiUrl
         });
-
-        // Start service discovery
-        await this.serviceDiscovery.start();
+        // Note: We don't start ServiceDiscovery - meta-core handles registration
 
         // If direct Redis URL provided, skip leader discovery
         if (this.config.redisUrl) {
@@ -110,27 +98,54 @@ export class KVManager {
             return;
         }
 
-        // Use leader discovery
-        this.leaderDiscovery = new LeaderDiscovery({
-            metaCorePath: this.config.metaCorePath
+        // Use leader client
+        this.leaderClient = new LeaderClient({
+            metaCorePath: this.config.metaCorePath,
+            metaCoreUrl: this.config.metaCoreUrl || undefined
         });
 
-        // Set up leader discovery callbacks
-        this.leaderDiscovery.onLeaderFound(async (info: LeaderLockInfo) => {
-            logger.info(`Connecting to leader at ${info.api}...`);
-            await this.connectToRedis(info.api);
+        // Set up leader change callback
+        this.leaderClient.onChange(async () => {
+            logger.info('Leader changed, reconnecting...');
+            await this.reconnect();
         });
 
-        this.leaderDiscovery.onLeaderLost(async () => {
-            logger.warn('Leader lost, disconnecting...');
-            await this.disconnectRedis();
-            this.notifyDisconnect();
-        });
+        // Wait for leader and connect
+        try {
+            const leaderInfo = await this.leaderClient.waitForLeader(30000);
+            logger.info(`Connecting to Redis at ${leaderInfo.redisUrl}...`);
+            await this.connectToRedis(leaderInfo.redisUrl);
+        } catch (error: any) {
+            logger.error(`Failed to connect to leader: ${error.message}`);
+            throw error;
+        }
 
-        // Start leader discovery
-        await this.leaderDiscovery.start();
+        // Start watching for leader changes
+        this.leaderClient.startWatching();
 
         this.isStarted = true;
+    }
+
+    /**
+     * Reconnect to Redis after leader change
+     */
+    private async reconnect(): Promise<void> {
+        if (this.isShuttingDown || !this.leaderClient) {
+            return;
+        }
+
+        // Disconnect existing
+        await this.disconnectRedis();
+        this.notifyDisconnect();
+
+        // Wait for new leader and connect
+        try {
+            const leaderInfo = await this.leaderClient.waitForLeader(30000);
+            logger.info(`Reconnecting to Redis at ${leaderInfo.redisUrl}...`);
+            await this.connectToRedis(leaderInfo.redisUrl);
+        } catch (error: any) {
+            logger.error(`Failed to reconnect: ${error.message}`);
+        }
     }
 
     /**
@@ -142,16 +157,16 @@ export class KVManager {
         logger.info('Stopping KVManager...');
         this.isShuttingDown = true;
 
-        // Stop service discovery
+        // Stop leader client
+        if (this.leaderClient) {
+            this.leaderClient.close();
+            this.leaderClient = null;
+        }
+
+        // Stop service discovery (if it was started)
         if (this.serviceDiscovery) {
             await this.serviceDiscovery.stop();
             this.serviceDiscovery = null;
-        }
-
-        // Stop leader discovery
-        if (this.leaderDiscovery) {
-            await this.leaderDiscovery.stop();
-            this.leaderDiscovery = null;
         }
 
         // Disconnect Redis
@@ -313,10 +328,17 @@ export class KVManager {
     }
 
     /**
-     * Get leader info (if using leader discovery)
+     * Get leader info
      */
     getLeaderInfo(): LeaderLockInfo | null {
-        return this.leaderDiscovery?.getLeaderInfo() ?? null;
+        return this.leaderClient?.getCachedLeaderInfo() ?? null;
+    }
+
+    /**
+     * Get leader client
+     */
+    getLeaderClient(): LeaderClient | null {
+        return this.leaderClient;
     }
 
     /**
