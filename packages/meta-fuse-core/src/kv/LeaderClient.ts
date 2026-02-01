@@ -42,18 +42,87 @@ export class LeaderClient {
     private watcher: FSWatcher | null = null;
     private onChangeCallbacks: (() => void)[] = [];
 
+    // URL caching
+    private cachedUrls: URLsResponse | null = null;
+    private urlsCacheTime: number = 0;
+    private readonly urlsCacheTTL: number = 5000; // 5 seconds
+
     constructor(config: LeaderClientConfig) {
         this.config = config;
         this.infoFilePath = `${config.metaCorePath}/locks/kv-leader.info`;
     }
 
     /**
-     * Read leader info from the info file
+     * Read API URL from file (plain text format)
+     */
+    private async getApiUrlFromFile(): Promise<string | null> {
+        try {
+            const content = await fs.readFile(this.infoFilePath, 'utf-8');
+            return content.trim() || null;
+        } catch (error: any) {
+            logger.error(`Failed to read API URL from file: ${error.message}`);
+            return null;
+        }
+    }
+
+    /**
+     * Fetch URLs from meta-core /urls API with caching
+     */
+    private async fetchUrls(apiUrl: string): Promise<URLsResponse | null> {
+        // Check cache
+        const now = Date.now();
+        if (this.cachedUrls && (now - this.urlsCacheTime) < this.urlsCacheTTL) {
+            return this.cachedUrls;
+        }
+
+        try {
+            const response = await fetch(`${apiUrl}/urls`, {
+                method: 'GET',
+                headers: { 'Accept': 'application/json' },
+                signal: AbortSignal.timeout(5000)
+            });
+
+            if (!response.ok) {
+                logger.error(`Failed to fetch URLs: ${response.status} ${response.statusText}`);
+                return null;
+            }
+
+            this.cachedUrls = await response.json() as URLsResponse;
+            this.urlsCacheTime = now;
+            return this.cachedUrls;
+        } catch (error: any) {
+            logger.error(`Error calling /urls API: ${error.message}`);
+            return null;
+        }
+    }
+
+    /**
+     * Read leader info from file and /urls API
      */
     async getLeaderInfo(): Promise<LeaderLockInfo | null> {
         try {
-            const content = await fs.readFile(this.infoFilePath, 'utf-8');
-            this.leaderInfo = JSON.parse(content) as LeaderLockInfo;
+            // Read API URL from file (plain text)
+            const apiUrl = await this.getApiUrlFromFile();
+            if (!apiUrl) {
+                return null;
+            }
+
+            // Fetch full info from /urls API
+            const urls = await this.fetchUrls(apiUrl);
+            if (!urls) {
+                return null;
+            }
+
+            // Convert URLsResponse to LeaderLockInfo
+            this.leaderInfo = {
+                hostname: urls.hostname,
+                baseUrl: urls.baseUrl,
+                apiUrl: urls.apiUrl,
+                redisUrl: urls.redisUrl,
+                webdavUrl: urls.webdavUrl,
+                timestamp: Date.now(),
+                pid: 0 // Unknown for remote leader
+            };
             return this.leaderInfo;
         } catch (error: any) {
             logger.error(`Failed to read leader info: ${error.message}`);
@@ -91,12 +160,11 @@ export class LeaderClient {
      */
     async getUrls(): Promise<URLsResponse | null> {
         // First try using configured metaCoreUrl
-        let apiUrl = this.config.metaCoreUrl;
+        let apiUrl: string | null = this.config.metaCoreUrl ?? null;
 
-        // Fall back to reading from leader info
+        // Fall back to reading from file
         if (!apiUrl) {
-            const info = await this.getLeaderInfo();
-            apiUrl = info?.apiUrl;
+            apiUrl = await this.getApiUrlFromFile();
         }
 
         if (!apiUrl) {
@@ -104,23 +172,7 @@ export class LeaderClient {
             return null;
         }
 
-        try {
-            const response = await fetch(`${apiUrl}/urls`, {
-                method: 'GET',
-                headers: { 'Accept': 'application/json' },
-                signal: AbortSignal.timeout(5000)
-            });
-
-            if (!response.ok) {
-                logger.error(`Failed to get URLs: ${response.status} ${response.statusText}`);
-                return null;
-            }
-
-            return await response.json() as URLsResponse;
-        } catch (error: any) {
-            logger.error(`Error calling /urls API: ${error.message}`);
-            return null;
-        }
+        return this.fetchUrls(apiUrl);
     }
 
     /**
@@ -157,7 +209,11 @@ export class LeaderClient {
         try {
             this.watcher = watch(lockDir, (eventType, filename) => {
                 if (filename === 'kv-leader.info') {
-                    logger.debug(`Lock file ${eventType}, checking for leader...`);
+                    logger.debug(`Lock file ${eventType}, invalidating cache...`);
+                    // Invalidate cache to force fresh API call
+                    this.cachedUrls = null;
+                    this.urlsCacheTime = 0;
+
                     this.getLeaderInfo().then(() => {
                         this.notifyChange();
                     }).catch((err) => logger.error(`Error reloading leader info: ${err.message}`));

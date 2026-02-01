@@ -80,15 +80,14 @@ export class KVManager {
 
         logger.info(`Starting KVManager for ${this.config.serviceName}...`);
 
-        // Initialize service discovery (meta-core handles actual registration)
-        // We keep this for service discovery (reading other services)
+        // Initialize and start service discovery for registration and heartbeat
         const apiUrl = this.config.baseUrl || `http://${hostname()}:${this.config.apiPort}`;
         this.serviceDiscovery = new ServiceDiscovery({
             metaCorePath: this.config.metaCorePath,
             serviceName: this.config.serviceName,
             apiUrl
         });
-        // Note: We don't start ServiceDiscovery - meta-core handles registration
+        await this.serviceDiscovery.start();
 
         // If direct Redis URL provided, skip leader discovery
         if (this.config.redisUrl) {

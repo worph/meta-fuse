@@ -267,12 +267,17 @@ export class APIServer {
       url: string;
       api: string;
       status: string;
-      capabilities: string[];
-      version: string;
+      role?: string;
     }
 
     const services: ServiceResponse[] = [];
-    let leaderInfo: { host: string; api: string; http: string } | null = null;
+    let leaderInfo: {
+      hostname: string;
+      baseUrl: string;
+      apiUrl: string;
+      redisUrl: string;
+      webdavUrl: string;
+    } | null = null;
 
     try {
       const serviceDiscovery = this.kvManager?.getServiceDiscovery();
@@ -280,17 +285,12 @@ export class APIServer {
         const allServices = await serviceDiscovery.discoverAllServices();
 
         for (const svc of allServices) {
-          // Build dashboard URL from API URL
-          const apiUrl = svc.api || '';
-          const dashboardPath = svc.endpoints?.dashboard || '/';
-
           services.push({
             name: svc.name || 'Unknown',
-            url: apiUrl + dashboardPath,
-            api: apiUrl,
+            url: svc.baseUrl || '',
+            api: svc.baseUrl || '',
             status: svc.status || 'unknown',
-            capabilities: svc.capabilities || [],
-            version: svc.version || '',
+            role: svc.role,
           });
         }
       }

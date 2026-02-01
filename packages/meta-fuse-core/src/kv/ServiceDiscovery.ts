@@ -7,8 +7,8 @@
  * Services can discover each other by reading these JSON files.
  * Stale detection: if lastHeartbeat > 60 seconds ago, service is considered stale.
  *
- * Note: meta-core (Go sidecar) handles actual service registration.
- * This class is primarily used for discovering other services.
+ * Each service must call start() to register itself and begin heartbeat updates.
+ * meta-core runs a cleanup process that removes services with stale heartbeats.
  */
 
 import { promises as fs } from 'fs';
@@ -79,9 +79,8 @@ export class ServiceDiscovery {
     }
 
     /**
-     * Register this service
-     * Note: In the new architecture, meta-core handles registration.
-     * This is kept for backwards compatibility and testing.
+     * Register this service by writing service info to the shared filesystem.
+     * meta-core's cleanup process monitors these files and removes stale entries.
      */
     async register(): Promise<void> {
         await this.ensureServicesDir();
@@ -292,8 +291,7 @@ export class ServiceDiscovery {
     // ========================================================================
 
     /**
-     * Full startup sequence
-     * Note: In the new architecture, meta-core handles registration.
+     * Full startup sequence: register service and start heartbeat loop.
      */
     async start(): Promise<void> {
         if (this.isStarted) return;

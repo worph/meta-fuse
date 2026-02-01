@@ -53,7 +53,6 @@ export interface VFSConfig {
     directoryMode?: number;
     uid?: number;
     gid?: number;
-    refreshInterval?: number;
     configDir?: string;  // Directory for config files (renaming rules, etc.)
     webdavBaseUrl?: string | null;  // meta-sort WebDAV URL for file access (e.g., http://meta-sort-dev/webdav)
     filesPath?: string;  // Local files path prefix to strip when building WebDAV URLs
@@ -69,7 +68,6 @@ export class VirtualFileSystem {
     private conditionEvaluator: ConditionEvaluator;
     private rulesConfig: RenamingConfig | null = null;
     private config: Required<VFSConfig>;
-    private refreshTimer: NodeJS.Timeout | null = null;
     private lastRefresh: Date | null = null;
 
     private cachedStats = {
@@ -93,7 +91,6 @@ export class VirtualFileSystem {
             directoryMode: config.directoryMode ?? 0o755,
             uid: config.uid ?? 1000,
             gid: config.gid ?? 1000,
-            refreshInterval: config.refreshInterval ?? 30000, // 30 seconds
             configDir,
             webdavBaseUrl: config.webdavBaseUrl ?? null,
             filesPath: config.filesPath ?? '/files',
@@ -120,54 +117,31 @@ export class VirtualFileSystem {
 
     /**
      * Start the VFS (connect to Redis and load data)
+     * Initial bootstrap only - updates come via Redis Streams
      */
     async start(): Promise<void> {
         logger.info('Starting VirtualFileSystem');
 
-        // Initial load
+        // Initial load from Redis (bootstrap)
         await this.refresh();
 
-        // Start periodic refresh
-        this.refreshTimer = setInterval(async () => {
-            try {
-                await this.refresh();
-            } catch (error) {
-                logger.error('Failed to refresh VFS:', error);
-            }
-        }, this.config.refreshInterval);
-
-        logger.info('VirtualFileSystem started');
+        logger.info('VirtualFileSystem started (updates via Redis Streams)');
     }
 
     /**
      * Stop the VFS
      */
     async stop(): Promise<void> {
-        if (this.refreshTimer) {
-            clearInterval(this.refreshTimer);
-            this.refreshTimer = null;
-        }
         logger.info('VirtualFileSystem stopped');
     }
 
     /**
      * Reset the VFS to empty state
      * Called when meta-sort triggers a fresh scan
-     * The VFS will be rebuilt incrementally as files are processed via pub/sub
-     *
-     * IMPORTANT: This stops the periodic refresh timer to prevent repopulating
-     * from Redis (which still has old data). The VFS will only update via
-     * incremental pub/sub events until the next full refresh is triggered.
+     * The VFS will be rebuilt incrementally as files are processed via Redis Streams
      */
     reset(): void {
         logger.info('Resetting VFS for fresh scan...');
-
-        // Stop periodic refresh to prevent repopulating from stale Redis data
-        if (this.refreshTimer) {
-            clearInterval(this.refreshTimer);
-            this.refreshTimer = null;
-            logger.info('Periodic refresh timer stopped - VFS will update via pub/sub only');
-        }
 
         this.initRoot();
         this.lastRefresh = null;
@@ -175,31 +149,13 @@ export class VirtualFileSystem {
     }
 
     /**
-     * Resume periodic refresh from Redis
-     * Called after a scan is complete to re-enable auto-refresh
-     */
-    resumePeriodicRefresh(): void {
-        if (this.refreshTimer) {
-            logger.debug('Periodic refresh already running');
-            return;
-        }
-
-        logger.info('Resuming periodic refresh from Redis');
-        this.refreshTimer = setInterval(async () => {
-            try {
-                await this.refresh();
-            } catch (error) {
-                logger.error('Failed to refresh VFS:', error);
-            }
-        }, this.config.refreshInterval);
-    }
-
-    /**
      * Refresh the VFS from Redis
+     * Called once on startup for initial bootstrap.
+     * Subsequent updates come via Redis Streams (onFileUpdate).
      * Uses template-based rules if configured, otherwise falls back to MetaDataToFolderStruct
      */
     async refresh(): Promise<void> {
-        logger.debug('Refreshing VFS from Redis');
+        logger.debug('Loading VFS from Redis (bootstrap)');
 
         try {
             // Load rules configuration

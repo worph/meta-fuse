@@ -3,43 +3,91 @@
  *
  * Standalone FUSE API server that reads metadata from Redis,
  * computes virtual paths, and exposes organized folder structure.
+ *
+ * Uses Redis Streams for reliable event delivery from meta-sort.
  */
 
 import 'dotenv/config';
 import { Logger } from 'tslog';
 import { KVManager } from './kv/KVManager.js';
-import { RedisClient } from './kv/RedisClient.js';
+import { RedisClient, StreamMessage } from './kv/RedisClient.js';
 import { VirtualFileSystem } from './vfs/VirtualFileSystem.js';
 import { APIServer } from './api/APIServer.js';
 
 const logger = new Logger({ name: 'meta-fuse' });
 
-// Pub/sub channel for batched updates from meta-sort
-const UPDATE_CHANNEL = 'meta-sort:file:batch';
-
-// Pub/sub channel for scan reset notification from meta-sort
-const RESET_CHANNEL = 'meta-sort:scan:reset';
-
-// Pub/sub channel for plugin completion events from meta-sort
-const PLUGIN_COMPLETE_CHANNEL = 'meta-sort:plugin:complete';
+// Redis Streams for reliable event delivery from meta-sort
+const EVENTS_STREAM = 'meta-sort:events';
+const CONSUMER_GROUP = 'meta-fuse-vfs';
 
 // Plugins that provide metadata needed for VFS virtual paths
 // When these complete, we should update the VFS entry for that file
 const VFS_RELEVANT_PLUGINS = new Set(['filename-parser', 'tmdb', 'jellyfin-nfo']);
 
-interface PluginCompleteMessage {
+interface PluginCompletePayload {
     fileHash: string;
     pluginId: string;
     filePath: string;
     timestamp: number;
 }
 
-interface BatchUpdateMessage {
+interface BatchUpdatePayload {
     timestamp: number;
     changes: Array<{
         action: 'add' | 'update' | 'remove';
         hashId: string;
     }>;
+}
+
+interface ResetPayload {
+    timestamp: number;
+    action: 'reset';
+}
+
+/**
+ * Handle a stream message from Redis Streams
+ * Routes messages by type to appropriate handlers
+ */
+async function handleStreamMessage(message: StreamMessage, vfs: VirtualFileSystem): Promise<void> {
+    try {
+        switch (message.type) {
+            case 'batch': {
+                const batch: BatchUpdatePayload = JSON.parse(message.payload);
+                logger.debug(`Processing batch update: ${batch.changes.length} changes`);
+
+                for (const change of batch.changes) {
+                    await vfs.onFileUpdate(change.hashId, change.action);
+                }
+                break;
+            }
+
+            case 'reset': {
+                const reset: ResetPayload = JSON.parse(message.payload);
+                logger.info(`Processing reset event: ${reset.action}`);
+
+                vfs.reset();
+                logger.info('VFS reset complete, awaiting new file updates');
+                break;
+            }
+
+            case 'plugin:complete': {
+                const event: PluginCompletePayload = JSON.parse(message.payload);
+
+                // Only process plugins that provide VFS-relevant metadata
+                if (VFS_RELEVANT_PLUGINS.has(event.pluginId)) {
+                    logger.debug(`Plugin ${event.pluginId} completed for ${event.fileHash}, updating VFS`);
+                    await vfs.onFileUpdate(event.fileHash, 'update');
+                }
+                break;
+            }
+
+            default:
+                logger.warn(`Unknown stream message type: ${message.type}`);
+        }
+    } catch (error: any) {
+        logger.error(`Error processing stream message ${message.id}:`, error.message);
+        throw error; // Re-throw to prevent ACK
+    }
 }
 
 async function main(): Promise<void> {
@@ -54,19 +102,11 @@ async function main(): Promise<void> {
         redisPrefix: process.env.REDIS_PREFIX ?? '',
         apiPort: parseInt(process.env.API_PORT ?? '3000', 10),
         apiHost: process.env.API_HOST ?? '0.0.0.0',
-        vfsRefreshInterval: parseInt(process.env.VFS_REFRESH_INTERVAL ?? '30000', 10),
         baseUrl: process.env.BASE_URL,
         serviceVersion: process.env.SERVICE_VERSION ?? '1.0.0',
-        // WebDAV URL for meta-core file access (e.g., http://meta-core/webdav)
-        metaCoreWebdavUrl: process.env.META_CORE_WEBDAV_URL,
     };
 
     logger.info(`Config: META_CORE_PATH=${config.metaCorePath}, FILES_VOLUME=${config.filesPath}`);
-    if (config.metaCoreWebdavUrl) {
-        logger.info(`WebDAV: Using meta-core WebDAV at ${config.metaCoreWebdavUrl}`);
-    } else {
-        logger.info(`WebDAV: Not configured, FUSE driver will use local filesystem`);
-    }
 
     // Initialize KV Manager (handles leader discovery)
     const kvManager = new KVManager({
@@ -75,6 +115,7 @@ async function main(): Promise<void> {
         serviceName: 'meta-fuse',
         apiPort: config.apiPort,
         baseUrl: config.baseUrl,
+        redisPrefix: config.redisPrefix,
     });
 
     let redisClient: RedisClient | null = null;
@@ -86,6 +127,10 @@ async function main(): Promise<void> {
         logger.info(`Received ${signal}, shutting down...`);
 
         try {
+            // Stop stream consumer first
+            if (redisClient) {
+                redisClient.stopStreamConsumer();
+            }
             if (apiServer) await apiServer.stop();
             if (vfs) await vfs.stop();
             await kvManager.stop();
@@ -113,69 +158,58 @@ async function main(): Promise<void> {
                 return;
             }
 
-            // Initialize VFS
+            // Get WebDAV URL from leader info (discovered via service discovery)
+            // Use hostname to construct internal URL since webdavUrl uses external baseUrl
+            const leaderInfo = kvManager.getLeaderInfo();
+            let webdavUrl: string | null = null;
+            if (leaderInfo?.hostname) {
+                // Construct internal WebDAV URL using leader hostname (nginx on port 80)
+                webdavUrl = `http://${leaderInfo.hostname}/webdav`;
+                logger.info(`WebDAV: Using ${webdavUrl} (from service discovery, leader: ${leaderInfo.hostname})`);
+            } else {
+                logger.info('WebDAV: Not available from leader, FUSE driver will use local filesystem');
+            }
+
+            // Initialize VFS (no periodic refresh - uses Redis Streams)
             vfs = new VirtualFileSystem(redisClient, {
                 fileMode: parseInt(process.env.FUSE_FILE_MODE ?? '644', 8),
                 directoryMode: parseInt(process.env.FUSE_DIR_MODE ?? '755', 8),
                 uid: parseInt(process.env.PUID ?? '1000', 10),
                 gid: parseInt(process.env.PGID ?? '1000', 10),
-                refreshInterval: config.vfsRefreshInterval,
                 configDir: process.env.CONFIG_DIR ?? '/meta-fuse/config',
-                webdavBaseUrl: config.metaCoreWebdavUrl,
+                webdavBaseUrl: webdavUrl,
                 filesPath: config.filesPath,
             });
 
-            // Start VFS
+            // Start VFS (initial load from Redis)
             logger.info('Starting VirtualFileSystem...');
             await vfs.start();
 
-            // Subscribe to batch updates from meta-sort
-            logger.info(`Subscribing to ${UPDATE_CHANNEL}...`);
-            await redisClient.subscribe(UPDATE_CHANNEL, async (message: string) => {
-                try {
-                    const batch: BatchUpdateMessage = JSON.parse(message);
-                    logger.debug(`Received batch update: ${batch.changes.length} changes`);
+            // Initialize Redis Streams consumer
+            logger.info(`Initializing stream consumer for ${EVENTS_STREAM}...`);
+            await redisClient.initStreamConsumer(EVENTS_STREAM, CONSUMER_GROUP);
 
-                    // Process each change incrementally
-                    for (const change of batch.changes) {
-                        await vfs!.onFileUpdate(change.hashId, change.action);
-                    }
-                } catch (error: any) {
-                    logger.error(`Error processing batch update: ${error.message}`);
+            // Process any pending entries from crashed consumers
+            await redisClient.processPendingEntries(
+                EVENTS_STREAM,
+                CONSUMER_GROUP,
+                30000, // 30 second idle threshold
+                async (message: StreamMessage) => {
+                    await handleStreamMessage(message, vfs!);
                 }
-            });
+            );
 
-            // Subscribe to scan reset events from meta-sort
-            logger.info(`Subscribing to ${RESET_CHANNEL}...`);
-            await redisClient.subscribe(RESET_CHANNEL, async (message: string) => {
-                try {
-                    const event = JSON.parse(message);
-                    logger.info(`Received scan reset event: ${event.action}`);
-
-                    // Reset VFS for fresh scan - will be rebuilt incrementally
-                    vfs!.reset();
-
-                    logger.info('VFS reset complete, awaiting new file updates from meta-sort');
-                } catch (error: any) {
-                    logger.error(`Error processing reset event: ${error.message}`);
-                }
-            });
-
-            // Subscribe to plugin completion events from meta-sort
-            // When relevant plugins complete (filename-parser, tmdb, etc.), update VFS
-            logger.info(`Subscribing to ${PLUGIN_COMPLETE_CHANNEL}...`);
-            await redisClient.subscribe(PLUGIN_COMPLETE_CHANNEL, async (message: string) => {
-                try {
-                    const event: PluginCompleteMessage = JSON.parse(message);
-
-                    // Only process plugins that provide VFS-relevant metadata
-                    if (VFS_RELEVANT_PLUGINS.has(event.pluginId)) {
-                        logger.debug(`Plugin ${event.pluginId} completed for ${event.fileHash}, updating VFS`);
-                        await vfs!.onFileUpdate(event.fileHash, 'update');
-                    }
-                } catch (error: any) {
-                    logger.error(`Error processing plugin complete event: ${error.message}`);
-                }
+            // Start stream consumer in background
+            logger.info('Starting stream consumer...');
+            redisClient.startStreamConsumer(
+                EVENTS_STREAM,
+                CONSUMER_GROUP,
+                async (message: StreamMessage) => {
+                    await handleStreamMessage(message, vfs!);
+                },
+                5000 // 5 second block timeout
+            ).catch(error => {
+                logger.error('Stream consumer error:', error);
             });
 
             // Initialize API server (with kvManager for service discovery)
