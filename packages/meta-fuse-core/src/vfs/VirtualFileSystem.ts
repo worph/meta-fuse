@@ -149,6 +149,26 @@ export class VirtualFileSystem {
     }
 
     /**
+     * Reset the VFS and immediately reload from Redis
+     * Called when meta-sort triggers a fresh scan (reset event)
+     * Unlike reset(), this method immediately repopulates from Redis keys.
+     */
+    async resetAndReload(): Promise<void> {
+        const startTime = Date.now();
+        logger.info('Resetting VFS and reloading from Redis...');
+
+        // Clear the VFS
+        this.initRoot();
+        this.lastRefresh = null;
+
+        // Immediately reload from Redis keys
+        await this.refresh();
+
+        const elapsed = Date.now() - startTime;
+        logger.info(`VFS reset and reload complete: ${this.cachedStats.fileCount} files in ${elapsed}ms`);
+    }
+
+    /**
      * Refresh the VFS from Redis
      * Called once on startup for initial bootstrap.
      * Subsequent updates come via Redis Streams (onFileUpdate).

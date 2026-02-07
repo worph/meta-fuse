@@ -64,9 +64,7 @@ async function handleStreamMessage(message: StreamMessage, vfs: VirtualFileSyste
             case 'reset': {
                 const reset: ResetPayload = JSON.parse(message.payload);
                 logger.info(`Processing reset event: ${reset.action}`);
-
-                vfs.reset();
-                logger.info('VFS reset complete, awaiting new file updates');
+                await vfs.resetAndReload();
                 break;
             }
 
