@@ -15,6 +15,7 @@ import { TemplateEngine } from './template/TemplateEngine.js';
 import { ConditionEvaluator } from './template/ConditionEvaluator.js';
 import { ConfigStorage } from '../config/ConfigStorage.js';
 import type { RenamingConfig, RenamingRule, PreviewItem, PreviewResponse } from './types/RenamingRuleTypes.js';
+import type { VFSUpdateCallback } from './StreamingStateBuilder.js';
 
 const logger = new Logger({ name: 'VirtualFileSystem' });
 
@@ -58,9 +59,10 @@ export interface VFSConfig {
     filesPath?: string;  // Local files path prefix to strip when building WebDAV URLs
 }
 
-export class VirtualFileSystem {
+export class VirtualFileSystem implements VFSUpdateCallback {
     private nodes: Map<string, VFSNode> = new Map();
     private sourcePathToVirtualPath: Map<string, string> = new Map();
+    private hashIdToVirtualPath: Map<string, string> = new Map();  // Track hashId -> virtualPath for streaming updates
     private redisClient: RedisClient;
     private configStorage: ConfigStorage;
     private metaDataToFolderStruct: MetaDataToFolderStruct;
@@ -69,6 +71,7 @@ export class VirtualFileSystem {
     private rulesConfig: RenamingConfig | null = null;
     private config: Required<VFSConfig>;
     private lastRefresh: Date | null = null;
+    private useStreamingMode: boolean = false;  // Flag to indicate streaming mode
 
     private cachedStats = {
         fileCount: 0,
@@ -106,6 +109,7 @@ export class VirtualFileSystem {
     private initRoot(): void {
         this.nodes.clear();
         this.sourcePathToVirtualPath.clear();
+        this.hashIdToVirtualPath.clear();
         this.nodes.set('/', {
             type: 'directory',
             name: '',
@@ -116,16 +120,124 @@ export class VirtualFileSystem {
     }
 
     /**
+     * Enable streaming mode
+     * In streaming mode, VFS is populated via event callbacks instead of refresh()
+     */
+    enableStreamingMode(): void {
+        this.useStreamingMode = true;
+        logger.info('VFS streaming mode enabled');
+    }
+
+    /**
+     * Convert flat properties map to FileMetadata
+     * Used when processing streaming events
+     *
+     * Note: During migration, not all metadata may be in flat key format yet.
+     * We extract what we can from filePath as a fallback.
+     */
+    private flatPropertiesToMetadata(props: Record<string, string>, hashId: string): FileMetadata {
+        // Get the original path (relative to FILES_VOLUME)
+        const originalPath = props.filePath ?? '';
+
+        // Resolve full source path by prepending FILES_VOLUME
+        let sourcePath = originalPath;
+        if (originalPath && !originalPath.startsWith('/')) {
+            sourcePath = `${this.config.filesPath}/${originalPath}`;
+        } else if (!originalPath.startsWith(this.config.filesPath) && originalPath.startsWith('/')) {
+            sourcePath = `${this.config.filesPath}${originalPath}`;
+        }
+
+        // Extract filename from path as fallback
+        const pathFileName = sourcePath ? path.basename(sourcePath) : undefined;
+        const fileName = props.fileName ?? pathFileName;
+
+        // Extract extension from filename
+        const extension = props.extension ?? (pathFileName ? path.extname(pathFileName).slice(1) : undefined);
+
+        // Parse size
+        const size = parseInt(props.fileSize ?? props.size ?? props.sizeByte ?? '0', 10);
+
+        // Parse timestamps
+        let mtime = 0;
+        if (props.mtime) {
+            const parsed = Date.parse(props.mtime);
+            mtime = isNaN(parsed) ? parseFloat(props.mtime) : parsed;
+        }
+
+        // Parse titles - can be from nested paths like 'titles/eng'
+        let titles: { eng?: string; [key: string]: string | undefined } | undefined;
+        if (props['titles/eng']) {
+            titles = { eng: props['titles/eng'] };
+        }
+
+        // Parse season/episode
+        const season = props.season !== undefined ? parseInt(props.season, 10) : undefined;
+        const episode = props.episode !== undefined ? parseInt(props.episode, 10) : undefined;
+
+        // Parse year
+        const movieYear = props.movieYear ? parseInt(props.movieYear, 10) : undefined;
+        const year = props.year ? parseInt(props.year, 10) : movieYear;
+
+        // Infer fileType from extension if not provided
+        let fileType = props.fileType;
+        if (!fileType && extension) {
+            const videoExts = ['mkv', 'mp4', 'avi', 'mov', 'wmv', 'flv', 'webm', 'm4v'];
+            const subtitleExts = ['srt', 'ass', 'ssa', 'sub', 'idx', 'vtt'];
+            const torrentExts = ['torrent'];
+
+            if (videoExts.includes(extension.toLowerCase())) {
+                fileType = 'video';
+            } else if (subtitleExts.includes(extension.toLowerCase())) {
+                fileType = 'subtitle';
+            } else if (torrentExts.includes(extension.toLowerCase())) {
+                fileType = 'torrent';
+            }
+        }
+
+        return {
+            sourcePath,
+            originalPath,
+            size,
+            mtime,
+            ctime: props.ctime ? parseFloat(props.ctime) : mtime,
+            hashId,
+            title: props.title,
+            titles,
+            originalTitle: props.originalTitle,
+            fileName,
+            season,
+            episode,
+            extra: props.extra === 'true',
+            movieYear,
+            year,
+            fileType,
+            extension,
+            version: props.version,
+            subtitleLanguage: props.subtitleLanguage,
+        };
+    }
+
+    /**
      * Start the VFS (connect to Redis and load data)
-     * Initial bootstrap only - updates come via Redis Streams
+     *
+     * In legacy mode: Does initial load from Redis using HGETALL/SCAN
+     * In streaming mode: Just initializes, data comes via StreamingStateBuilder events
      */
     async start(): Promise<void> {
         logger.info('Starting VirtualFileSystem');
 
-        // Initial load from Redis (bootstrap)
-        await this.refresh();
+        // Load rules configuration
+        this.loadRulesConfig();
 
-        logger.info('VirtualFileSystem started (updates via Redis Streams)');
+        if (this.useStreamingMode) {
+            // In streaming mode, VFS is populated via event callbacks
+            // StreamingStateBuilder will call onFileComplete for each file
+            logger.info('VirtualFileSystem started in streaming mode (data via events)');
+        } else {
+            // Legacy mode: Initial load from Redis (bootstrap)
+            await this.refresh();
+            logger.info('VirtualFileSystem started in legacy mode (updates via Redis Streams)');
+        }
     }
 
     /**
@@ -902,5 +1014,152 @@ export class VirtualFileSystem {
         }
 
         return null;
+    }
+
+    // ============================================
+    // VFSUpdateCallback Implementation
+    // (for streaming state builder integration)
+    // ============================================
+
+    /**
+     * Handle a property change event from the streaming state builder
+     * This is called for each VFS-relevant property that changes
+     *
+     * In streaming mode, we don't immediately update the VFS on every property change.
+     * Instead, we wait for onFileComplete which has the full metadata.
+     */
+    onPropertyChange(hashId: string, property: string, value: string): void {
+        // In streaming mode, individual property changes don't trigger VFS updates
+        // The VFS is updated when onFileComplete is called with full metadata
+        logger.debug(`Property changed for ${hashId}: ${property}=${value.substring(0, 50)}...`);
+    }
+
+    /**
+     * Handle a property delete event from the streaming state builder
+     */
+    onPropertyDelete(hashId: string, property: string): void {
+        logger.debug(`Property deleted for ${hashId}: ${property}`);
+
+        // If filePath was deleted, the file should be removed from VFS
+        // This is handled by onFileDelete, so we just log here
+    }
+
+    /**
+     * Handle file deletion from the streaming state builder
+     * Called when filePath is deleted or all properties are removed
+     */
+    onFileDelete(hashId: string): void {
+        const virtualPath = this.hashIdToVirtualPath.get(hashId);
+
+        if (virtualPath) {
+            this.removeFile(virtualPath);
+            this.hashIdToVirtualPath.delete(hashId);
+            logger.debug(`File deleted from VFS: ${hashId} -> ${virtualPath}`);
+        }
+    }
+
+    /**
+     * Handle file complete event from the streaming state builder
+     * Called when a file has filePath and enough metadata to compute virtual path
+     *
+     * @param hashId - The file hash ID
+     * @param metadata - Flat properties map from the streaming state builder
+     */
+    onFileComplete(hashId: string, metadata: Record<string, string>): void {
+        // Load rules if not loaded
+        if (!this.rulesConfig) {
+            this.loadRulesConfig();
+        }
+
+        // Convert flat properties to FileMetadata
+        const fileMetadata = this.flatPropertiesToMetadata(metadata, hashId);
+
+        if (!fileMetadata.sourcePath) {
+            logger.warn(`onFileComplete: No sourcePath for ${hashId}`);
+            return;
+        }
+
+        // Compute virtual path
+        const virtualPath = this.computeVirtualPath(fileMetadata, fileMetadata.sourcePath);
+
+        if (!virtualPath) {
+            logger.debug(`Could not compute virtual path for: ${fileMetadata.sourcePath}`);
+            return;
+        }
+
+        // If file already exists at a different virtual path, remove old entry
+        const oldVirtualPath = this.hashIdToVirtualPath.get(hashId);
+        if (oldVirtualPath && oldVirtualPath !== virtualPath) {
+            this.removeFile(oldVirtualPath);
+        }
+
+        // Add/update file in VFS
+        this.addFileSync(virtualPath, fileMetadata);
+        this.sourcePathToVirtualPath.set(fileMetadata.sourcePath, virtualPath);
+        this.hashIdToVirtualPath.set(hashId, virtualPath);
+
+        logger.debug(`File complete: ${hashId} -> ${virtualPath}`);
+        this.lastRefresh = new Date();
+    }
+
+    /**
+     * Synchronous version of addFile for streaming updates
+     * Used by onFileComplete which is called synchronously from event processing
+     */
+    private addFileSync(virtualPath: string, metadata: FileMetadata): void {
+        virtualPath = this.normalizePath(virtualPath);
+
+        // Skip if file already exists at this path
+        if (this.nodes.has(virtualPath) && this.nodes.get(virtualPath)!.type === 'file') {
+            // Update existing file
+            const node = this.nodes.get(virtualPath)!;
+            const oldSize = node.size ?? 0;
+            this.cachedStats.totalSize -= oldSize;
+            this.cachedStats.fileCount--;
+        }
+
+        // Create parent directories
+        const dirname = path.dirname(virtualPath);
+        this.ensureDirectory(dirname);
+
+        // Get file stats from metadata
+        const size = metadata.size || 0;
+        const mtime = new Date(metadata.mtime || Date.now());
+        const ctime = new Date(metadata.ctime || metadata.mtime || Date.now());
+
+        // Add file node
+        const filename = path.basename(virtualPath);
+        this.nodes.set(virtualPath, {
+            type: 'file',
+            name: filename,
+            parent: dirname,
+            sourcePath: metadata.sourcePath,
+            size,
+            mtime,
+            ctime,
+            metadata,
+        });
+
+        // Add to parent's children
+        const parentNode = this.nodes.get(dirname);
+        if (parentNode && parentNode.type === 'directory') {
+            parentNode.children!.add(filename);
+        }
+
+        // Update stats
+        this.cachedStats.fileCount++;
+        this.cachedStats.totalSize += size;
+    }
+
+    /**
+     * Update a file in VFS when its metadata changes
+     * Called when streaming events indicate a property change for an existing file
+     *
+     * @param hashId - The file hash ID
+     * @param metadata - Updated metadata properties
+     */
+    updateFileFromStreaming(hashId: string, metadata: Record<string, string>): void {
+        // Just delegate to onFileComplete which handles both add and update
+        this.onFileComplete(hashId, metadata);
     }
 }

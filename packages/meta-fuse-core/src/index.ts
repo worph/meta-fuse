@@ -12,112 +12,35 @@ import { Logger } from 'tslog';
 import { KVManager } from './kv/KVManager.js';
 import { RedisClient, StreamMessage } from './kv/RedisClient.js';
 import { VirtualFileSystem } from './vfs/VirtualFileSystem.js';
+import { StreamingStateBuilder } from './vfs/StreamingStateBuilder.js';
 import { APIServer } from './api/APIServer.js';
 
 const logger = new Logger({ name: 'meta-fuse' });
 
-// Redis Streams for reliable event delivery from meta-core
-const EVENTS_STREAM = 'file:events';
-const CONSUMER_GROUP = 'meta-fuse-vfs';
+// Redis Streams - using new meta:events stream from meta-core flat key architecture
+const EVENTS_STREAM = 'meta:events';
 
-// Plugins that provide metadata needed for VFS virtual paths (for legacy plugin:complete events)
-// When these complete, we should update the VFS entry for that file
-const VFS_RELEVANT_PLUGINS = new Set(['filename-parser', 'tmdb', 'jellyfin-nfo']);
-
-interface PluginCompletePayload {
-    fileHash: string;
-    pluginId: string;
-    filePath: string;
-    timestamp: number;
-}
-
-interface BatchUpdatePayload {
-    timestamp: number;
-    changes: Array<{
-        action: 'add' | 'update' | 'remove';
-        hashId: string;
-    }>;
-}
-
-interface ResetPayload {
-    timestamp: number;
-    action: 'reset';
-}
+// Legacy stream name for backward compatibility during transition
+const LEGACY_EVENTS_STREAM = 'file:events';
 
 /**
- * Handle a stream message from Redis Streams
- * Routes messages by type to appropriate handlers
+ * Handle a stream message from meta:events stream
  *
- * Event types:
- * - add/change/delete/rename: Direct file events from meta-core (path-based)
- * - batch/reset/plugin:complete: Legacy events from meta-sort (hashId-based)
+ * New meta:events format (flat key architecture):
+ * - set/del: Property-level changes, processed by StreamingStateBuilder
+ *
+ * The StreamingStateBuilder filters events by VFS-relevant properties,
+ * fetches values, and notifies VFS when files are complete.
  */
-async function handleStreamMessage(message: StreamMessage, vfs: VirtualFileSystem): Promise<void> {
+async function handleStreamingEvent(
+    message: StreamMessage,
+    stateBuilder: StreamingStateBuilder
+): Promise<void> {
     try {
-        switch (message.type) {
-            // Direct file events from meta-core
-            case 'add': {
-                logger.debug(`File added: ${message.path}`);
-                await vfs.onFileEventByPath(message.path!, 'add');
-                break;
-            }
-
-            case 'change': {
-                logger.debug(`File changed: ${message.path}`);
-                await vfs.onFileEventByPath(message.path!, 'change');
-                break;
-            }
-
-            case 'delete': {
-                logger.debug(`File deleted: ${message.path}`);
-                await vfs.onFileEventByPath(message.path!, 'delete');
-                break;
-            }
-
-            case 'rename': {
-                logger.debug(`File renamed: ${message.oldPath} -> ${message.path}`);
-                await vfs.onFileEventByPath(message.path!, 'rename', message.oldPath);
-                break;
-            }
-
-            // Legacy events from meta-sort (for backward compatibility)
-            case 'batch': {
-                if (!message.payload) break;
-                const batch: BatchUpdatePayload = JSON.parse(message.payload);
-                logger.debug(`Processing batch update: ${batch.changes.length} changes`);
-
-                for (const change of batch.changes) {
-                    await vfs.onFileUpdate(change.hashId, change.action);
-                }
-                break;
-            }
-
-            case 'reset': {
-                if (!message.payload) break;
-                const reset: ResetPayload = JSON.parse(message.payload);
-                logger.info(`Processing reset event: ${reset.action}`);
-                await vfs.resetAndReload();
-                break;
-            }
-
-            case 'plugin:complete': {
-                if (!message.payload) break;
-                const event: PluginCompletePayload = JSON.parse(message.payload);
-
-                // Only process plugins that provide VFS-relevant metadata
-                if (VFS_RELEVANT_PLUGINS.has(event.pluginId)) {
-                    logger.debug(`Plugin ${event.pluginId} completed for ${event.fileHash}, updating VFS`);
-                    await vfs.onFileUpdate(event.fileHash, 'update');
-                }
-                break;
-            }
-
-            default:
-                logger.warn(`Unknown stream message type: ${message.type}`);
-        }
+        await stateBuilder.processEvent(message);
     } catch (error: any) {
         logger.error(`Error processing stream message ${message.id}:`, error.message);
-        throw error; // Re-throw to prevent ACK
+        throw error;
     }
 }
 
@@ -151,6 +74,7 @@ async function main(): Promise<void> {
 
     let redisClient: RedisClient | null = null;
     let vfs: VirtualFileSystem | null = null;
+    let stateBuilder: StreamingStateBuilder | null = null;
     let apiServer: APIServer | null = null;
 
     // Graceful shutdown
@@ -178,7 +102,7 @@ async function main(): Promise<void> {
 
     // Handle ready event from KV manager
     kvManager.onReady(async () => {
-        logger.info('KV Manager ready, initializing VFS...');
+        logger.info('KV Manager ready, initializing VFS with streaming bootstrap...');
 
         try {
             // Get Redis client from KV manager
@@ -201,7 +125,7 @@ async function main(): Promise<void> {
                 logger.info('WebDAV: Not available from leader, FUSE driver will use local filesystem');
             }
 
-            // Initialize VFS (no periodic refresh - uses Redis Streams)
+            // Initialize VFS in streaming mode (no HGETALL/SCAN bootstrap)
             vfs = new VirtualFileSystem(redisClient, {
                 fileMode: parseInt(process.env.FUSE_FILE_MODE ?? '644', 8),
                 directoryMode: parseInt(process.env.FUSE_DIR_MODE ?? '755', 8),
@@ -212,31 +136,46 @@ async function main(): Promise<void> {
                 filesPath: config.filesPath,
             });
 
-            // Start VFS (initial load from Redis)
-            logger.info('Starting VirtualFileSystem...');
+            // Enable streaming mode - VFS will be populated via event callbacks
+            vfs.enableStreamingMode();
+
+            // Start VFS (just initializes, no data load in streaming mode)
+            logger.info('Starting VirtualFileSystem in streaming mode...');
             await vfs.start();
 
-            // Initialize Redis Streams consumer
-            logger.info(`Initializing stream consumer for ${EVENTS_STREAM}...`);
-            await redisClient.initStreamConsumer(EVENTS_STREAM, CONSUMER_GROUP);
+            // Create streaming state builder with VFS as callback
+            stateBuilder = new StreamingStateBuilder({
+                redisClient,
+                rulesConfig: vfs.getRulesConfig(),
+                vfsCallback: vfs,
+                filesPath: config.filesPath,
+            });
 
-            // Process any pending entries from crashed consumers
-            await redisClient.processPendingEntries(
+            // Bootstrap: Replay meta:events stream from position 0
+            // This rebuilds state from all historical events
+            logger.info(`Replaying ${EVENTS_STREAM} stream from position 0 (streaming bootstrap)...`);
+            const bootstrapStart = Date.now();
+
+            const lastId = await redisClient.replayStream(
                 EVENTS_STREAM,
-                CONSUMER_GROUP,
-                30000, // 30 second idle threshold
+                '0',
                 async (message: StreamMessage) => {
-                    await handleStreamMessage(message, vfs!);
-                }
+                    await handleStreamingEvent(message, stateBuilder!);
+                },
+                100 // Batch size
             );
 
-            // Start stream consumer in background
-            logger.info('Starting stream consumer...');
-            redisClient.startStreamConsumer(
+            const bootstrapTime = Date.now() - bootstrapStart;
+            const stats = vfs.getStats();
+            logger.info(`Streaming bootstrap complete: ${stats.fileCount} files in ${bootstrapTime}ms`);
+
+            // Start live stream consumer from where replay left off
+            logger.info(`Starting live stream consumer from ${lastId}...`);
+            redisClient.startSimpleStreamConsumer(
                 EVENTS_STREAM,
-                CONSUMER_GROUP,
+                lastId,
                 async (message: StreamMessage) => {
-                    await handleStreamMessage(message, vfs!);
+                    await handleStreamingEvent(message, stateBuilder!);
                 },
                 5000 // 5 second block timeout
             ).catch(error => {
@@ -256,9 +195,13 @@ async function main(): Promise<void> {
             logger.info('meta-fuse is ready!');
             logger.info(`API: http://${config.apiHost}:${config.apiPort}`);
 
-            // Log initial stats
-            const stats = vfs.getStats();
-            logger.info(`VFS: ${stats.fileCount} files, ${stats.directoryCount} directories`);
+            // Log final stats
+            const finalStats = vfs.getStats();
+            logger.info(`VFS: ${finalStats.fileCount} files, ${finalStats.directoryCount} directories`);
+
+            // Log streaming state builder stats
+            const builderStats = stateBuilder.getStats();
+            logger.info(`State builder: ${builderStats.eventsProcessed} events, ${builderStats.propertiesFetched} properties fetched, ${builderStats.propertiesSkipped} skipped`);
         } catch (error) {
             logger.error('Failed to initialize after KV ready:', error);
         }

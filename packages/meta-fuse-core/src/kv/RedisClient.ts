@@ -17,20 +17,38 @@ const logger = new Logger({ name: 'RedisClient' });
 
 /**
  * Stream message from Redis Streams
- * File events from meta-core: add, change, delete, rename
- * Legacy events from meta-sort: batch, reset, plugin:complete
+ *
+ * New meta:events format (from meta-core flat key architecture):
+ * - type: 'set' | 'del' - keyspace notification type
+ * - key: 'file:abc123/property' - the Redis key that changed
+ * - ts: timestamp
+ *
+ * Legacy file:events format (deprecated):
+ * - type: add, change, delete, rename, batch, reset, plugin:complete
+ * - path, size, midhash256, oldPath, payload fields
  */
 export interface StreamMessage {
     id: string;
-    type: 'add' | 'change' | 'delete' | 'rename' | 'batch' | 'reset' | 'plugin:complete';
-    // Direct file event fields (from meta-core)
+    type: 'set' | 'del' | 'add' | 'change' | 'delete' | 'rename' | 'batch' | 'reset' | 'plugin:complete';
+    // New meta:events fields (flat key architecture)
+    key?: string;         // Redis key that changed: file:abc123/property
+    ts?: string;          // Timestamp
+    // Legacy file:events fields (for backward compatibility)
     path?: string;
     size?: string;
     midhash256?: string;  // midhash256 CID computed by meta-core
     oldPath?: string;
-    // Legacy payload field (for backward compatibility)
     payload?: string;
     timestamp: string;
+}
+
+/**
+ * Parsed meta:events key
+ * Extracts hashId and property from keys like 'file:abc123/property'
+ */
+export interface ParsedMetaEventKey {
+    hashId: string;
+    property: string;
 }
 
 /**
@@ -224,8 +242,108 @@ export class RedisClient implements Partial<IKVClient> {
         return this.isConnected;
     }
 
+    // ========================================================================
+    // Flat Key Methods (for meta-core flat key architecture)
+    // ========================================================================
+
+    /**
+     * Get a single property value from Redis using flat key format
+     * Key format: file:{hashId}/{property}
+     *
+     * @param hashId - The file hash ID
+     * @param property - The property name (can include / for nested props like 'titles/eng')
+     * @returns The property value or null if not found
+     */
+    async getProperty(hashId: string, property: string): Promise<string | null> {
+        if (!this.client || !this.isConnected) {
+            return null;
+        }
+
+        try {
+            const key = `${this.config.prefix}file:${hashId}/${property}`;
+            return await this.client.get(key);
+        } catch (error: any) {
+            logger.error(`Failed to get property ${property} for ${hashId}:`, error.message);
+            return null;
+        }
+    }
+
+    /**
+     * Get multiple properties for a file using flat keys
+     * More efficient than multiple getProperty calls using MGET
+     *
+     * @param hashId - The file hash ID
+     * @param properties - Array of property names to fetch
+     * @returns Map of property name to value (null values excluded)
+     */
+    async getProperties(hashId: string, properties: string[]): Promise<Map<string, string>> {
+        const result = new Map<string, string>();
+
+        if (!this.client || !this.isConnected || properties.length === 0) {
+            return result;
+        }
+
+        try {
+            const keys = properties.map(prop => `${this.config.prefix}file:${hashId}/${prop}`);
+            const values = await this.client.mget(keys);
+
+            for (let i = 0; i < properties.length; i++) {
+                const value = values[i];
+                if (value !== null) {
+                    result.set(properties[i], value);
+                }
+            }
+        } catch (error: any) {
+            logger.error(`Failed to get properties for ${hashId}:`, error.message);
+        }
+
+        return result;
+    }
+
+    /**
+     * Parse a meta:events key to extract hashId and property
+     * Key format: file:{hashId}/{property}
+     *
+     * @param key - The Redis key from the event
+     * @returns Parsed key with hashId and property, or null if invalid format
+     */
+    parseMetaEventKey(key: string): ParsedMetaEventKey | null {
+        // Remove prefix if present
+        let keyWithoutPrefix = key;
+        if (this.config.prefix && key.startsWith(this.config.prefix)) {
+            keyWithoutPrefix = key.slice(this.config.prefix.length);
+        }
+
+        // Key format: file:{hashId}/{property}
+        // Property can contain slashes (e.g., 'titles/eng')
+        const match = keyWithoutPrefix.match(/^file:([^/]+)\/(.+)$/);
+        if (!match) {
+            return null;
+        }
+
+        return {
+            hashId: match[1],
+            property: match[2],
+        };
+    }
+
+    /**
+     * Check if a key is a file metadata key (vs other keys like indexes)
+     *
+     * @param key - The Redis key to check
+     * @returns True if this is a file metadata key
+     */
+    isFileMetadataKey(key: string): boolean {
+        return this.parseMetaEventKey(key) !== null;
+    }
+
+    // ========================================================================
+    // Legacy HGETALL-based Methods (deprecated, kept for compatibility)
+    // ========================================================================
+
     /**
      * Get all file metadata from Redis
+     * @deprecated Use streaming state builder with flat keys instead
      */
     async getAllFiles(): Promise<Map<string, FileMetadata>> {
         const files = new Map<string, FileMetadata>();
@@ -288,6 +406,7 @@ export class RedisClient implements Partial<IKVClient> {
 
     /**
      * Get file metadata by hash ID
+     * @deprecated Use streaming state builder with flat keys instead
      */
     async getFileByHashId(hashId: string): Promise<FileMetadata | null> {
         if (!this.client || !this.isConnected) {
@@ -673,10 +792,182 @@ export class RedisClient implements Partial<IKVClient> {
     }
 
     /**
+     * Read stream entries from a specific position using XREAD (no consumer groups)
+     * Used for streaming bootstrap - replays all events from the beginning
+     *
+     * @param stream - Stream name
+     * @param fromId - Start position ('0' for beginning, '$' for end/new only)
+     * @param count - Maximum entries to read per call
+     * @param blockMs - Block timeout (0 for non-blocking)
+     * @returns Array of [id, message] tuples, empty if none
+     */
+    async readStreamFrom(
+        stream: string,
+        fromId: string,
+        count: number = 100,
+        blockMs: number = 0
+    ): Promise<Array<{ id: string; message: StreamMessage }>> {
+        if (!this.client || !this.isConnected) {
+            return [];
+        }
+
+        try {
+            let result: Array<[string, Array<[string, string[]]>]> | null;
+
+            if (blockMs > 0) {
+                result = await this.client.call(
+                    'XREAD',
+                    'BLOCK', blockMs,
+                    'COUNT', count,
+                    'STREAMS', stream,
+                    fromId
+                ) as typeof result;
+            } else {
+                result = await this.client.call(
+                    'XREAD',
+                    'COUNT', count,
+                    'STREAMS', stream,
+                    fromId
+                ) as typeof result;
+            }
+
+            if (!result || result.length === 0) {
+                return [];
+            }
+
+            const entries: Array<{ id: string; message: StreamMessage }> = [];
+
+            for (const [_streamName, streamEntries] of result) {
+                for (const [id, fields] of streamEntries) {
+                    const message = this.parseStreamEntry(id, fields);
+                    if (message) {
+                        entries.push({ id, message });
+                    }
+                }
+            }
+
+            return entries;
+        } catch (error: any) {
+            logger.error('Error reading stream:', error.message);
+            return [];
+        }
+    }
+
+    /**
+     * Read all stream entries from a position, calling handler for each
+     * Returns the last processed entry ID for resumption
+     *
+     * @param stream - Stream name
+     * @param fromId - Start position ('0' for beginning)
+     * @param onMessage - Handler for each message
+     * @param batchSize - Entries per read
+     * @returns Last processed entry ID, or fromId if no entries
+     */
+    async replayStream(
+        stream: string,
+        fromId: string,
+        onMessage: StreamMessageHandler,
+        batchSize: number = 100
+    ): Promise<string> {
+        let lastId = fromId;
+        let totalProcessed = 0;
+        const startTime = Date.now();
+
+        logger.info(`Replaying stream ${stream} from position ${fromId}...`);
+
+        while (true) {
+            const entries = await this.readStreamFrom(stream, lastId, batchSize, 0);
+
+            if (entries.length === 0) {
+                break;
+            }
+
+            for (const { id, message } of entries) {
+                try {
+                    await onMessage(message);
+                    lastId = id;
+                    totalProcessed++;
+                } catch (error: any) {
+                    logger.error(`Error processing stream entry ${id}:`, error.message);
+                    // Continue with next entry
+                }
+            }
+
+            // If we got fewer than batchSize entries, we've reached the end
+            if (entries.length < batchSize) {
+                break;
+            }
+        }
+
+        const elapsed = Date.now() - startTime;
+        logger.info(`Stream replay complete: ${totalProcessed} entries in ${elapsed}ms, last ID: ${lastId}`);
+
+        return lastId;
+    }
+
+    /**
+     * Start a stream consumer that reads from a specific position using XREAD
+     * Does not use consumer groups - for simpler replay/live consumption
+     *
+     * @param stream - Stream name
+     * @param fromId - Start position ('0' for beginning, or last ID from replayStream)
+     * @param onMessage - Handler for each message
+     * @param blockMs - Block timeout for polling (default: 5000)
+     */
+    async startSimpleStreamConsumer(
+        stream: string,
+        fromId: string,
+        onMessage: StreamMessageHandler,
+        blockMs: number = 5000
+    ): Promise<void> {
+        if (!this.client) {
+            throw new Error('Redis not connected');
+        }
+
+        if (this.streamConsumerRunning) {
+            logger.warn('Stream consumer already running');
+            return;
+        }
+
+        this.streamConsumerRunning = true;
+        this.streamConsumerAbort = new AbortController();
+
+        let lastId = fromId;
+        logger.info(`Starting simple stream consumer: ${stream} from ${fromId}`);
+
+        while (this.streamConsumerRunning && !this.streamConsumerAbort.signal.aborted) {
+            try {
+                const entries = await this.readStreamFrom(stream, lastId, 10, blockMs);
+
+                for (const { id, message } of entries) {
+                    try {
+                        await onMessage(message);
+                        lastId = id;
+                    } catch (error: any) {
+                        logger.error(`Error processing stream entry ${id}:`, error.message);
+                    }
+                }
+            } catch (error: any) {
+                if (this.streamConsumerAbort?.signal.aborted) {
+                    break;
+                }
+                logger.error('Stream consumer error:', error.message);
+                await new Promise(resolve => setTimeout(resolve, 1000));
+            }
+        }
+
+        logger.info('Simple stream consumer stopped');
+    }
+
+    /**
      * Parse a stream entry into a StreamMessage
+     *
+     * Supports two formats:
+     * 1. New meta:events format: { type: 'set'|'del', key: 'file:abc123/prop', ts: '...' }
+     * 2. Legacy file:events format: { type: 'add'|'change'|..., path: '...', payload: '...' }
      */
     private parseStreamEntry(id: string, fields: string[]): StreamMessage | null {
-        // Fields come as flat array: ['type', 'add', 'path', '...', 'timestamp', '123']
+        // Fields come as flat array: ['type', 'set', 'key', 'file:abc123/prop', 'ts', '123']
         const fieldMap: Record<string, string> = {};
         for (let i = 0; i < fields.length; i += 2) {
             fieldMap[fields[i]] = fields[i + 1];
@@ -687,6 +978,24 @@ export class RedisClient implements Partial<IKVClient> {
             return null;
         }
 
+        // New meta:events format (set/del events with key field)
+        const metaEventTypes = ['set', 'del'];
+        if (metaEventTypes.includes(fieldMap.type)) {
+            if (!fieldMap.key) {
+                logger.warn(`Invalid stream entry ${id}: missing key for ${fieldMap.type} event`);
+                return null;
+            }
+
+            return {
+                id,
+                type: fieldMap.type as 'set' | 'del',
+                key: fieldMap.key,
+                ts: fieldMap.ts,
+                timestamp: fieldMap.ts || fieldMap.timestamp || '0',
+            };
+        }
+
+        // Legacy file:events format
         // For direct file events (add/change/delete/rename), path is required
         // For legacy events (batch/reset/plugin:complete), payload is required
         const directEventTypes = ['add', 'change', 'delete', 'rename'];
@@ -697,7 +1006,8 @@ export class RedisClient implements Partial<IKVClient> {
             return null;
         }
 
-        if (!isDirectEvent && !fieldMap.payload) {
+        const legacyEventTypes = ['batch', 'reset', 'plugin:complete'];
+        if (legacyEventTypes.includes(fieldMap.type) && !fieldMap.payload) {
             logger.warn(`Invalid stream entry ${id}: missing payload for ${fieldMap.type} event`);
             return null;
         }
