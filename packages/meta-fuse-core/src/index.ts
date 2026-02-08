@@ -16,11 +16,11 @@ import { APIServer } from './api/APIServer.js';
 
 const logger = new Logger({ name: 'meta-fuse' });
 
-// Redis Streams for reliable event delivery from meta-sort
-const EVENTS_STREAM = 'meta-sort:events';
+// Redis Streams for reliable event delivery from meta-core
+const EVENTS_STREAM = 'file:events';
 const CONSUMER_GROUP = 'meta-fuse-vfs';
 
-// Plugins that provide metadata needed for VFS virtual paths
+// Plugins that provide metadata needed for VFS virtual paths (for legacy plugin:complete events)
 // When these complete, we should update the VFS entry for that file
 const VFS_RELEVANT_PLUGINS = new Set(['filename-parser', 'tmdb', 'jellyfin-nfo']);
 
@@ -47,11 +47,42 @@ interface ResetPayload {
 /**
  * Handle a stream message from Redis Streams
  * Routes messages by type to appropriate handlers
+ *
+ * Event types:
+ * - add/change/delete/rename: Direct file events from meta-core (path-based)
+ * - batch/reset/plugin:complete: Legacy events from meta-sort (hashId-based)
  */
 async function handleStreamMessage(message: StreamMessage, vfs: VirtualFileSystem): Promise<void> {
     try {
         switch (message.type) {
+            // Direct file events from meta-core
+            case 'add': {
+                logger.debug(`File added: ${message.path}`);
+                await vfs.onFileEventByPath(message.path!, 'add');
+                break;
+            }
+
+            case 'change': {
+                logger.debug(`File changed: ${message.path}`);
+                await vfs.onFileEventByPath(message.path!, 'change');
+                break;
+            }
+
+            case 'delete': {
+                logger.debug(`File deleted: ${message.path}`);
+                await vfs.onFileEventByPath(message.path!, 'delete');
+                break;
+            }
+
+            case 'rename': {
+                logger.debug(`File renamed: ${message.oldPath} -> ${message.path}`);
+                await vfs.onFileEventByPath(message.path!, 'rename', message.oldPath);
+                break;
+            }
+
+            // Legacy events from meta-sort (for backward compatibility)
             case 'batch': {
+                if (!message.payload) break;
                 const batch: BatchUpdatePayload = JSON.parse(message.payload);
                 logger.debug(`Processing batch update: ${batch.changes.length} changes`);
 
@@ -62,6 +93,7 @@ async function handleStreamMessage(message: StreamMessage, vfs: VirtualFileSyste
             }
 
             case 'reset': {
+                if (!message.payload) break;
                 const reset: ResetPayload = JSON.parse(message.payload);
                 logger.info(`Processing reset event: ${reset.action}`);
                 await vfs.resetAndReload();
@@ -69,6 +101,7 @@ async function handleStreamMessage(message: StreamMessage, vfs: VirtualFileSyste
             }
 
             case 'plugin:complete': {
+                if (!message.payload) break;
                 const event: PluginCompletePayload = JSON.parse(message.payload);
 
                 // Only process plugins that provide VFS-relevant metadata

@@ -264,7 +264,74 @@ export class VirtualFileSystem {
     }
 
     /**
-     * Handle incremental file update from pub/sub
+     * Handle file event by path (from meta-core)
+     * Used for direct file events where we have the path but not the hashId
+     *
+     * @param path - File path relative to FILES_VOLUME
+     * @param action - Event type: add, change, delete, rename
+     * @param oldPath - For rename events, the old path
+     */
+    async onFileEventByPath(path: string, action: 'add' | 'change' | 'delete' | 'rename', oldPath?: string): Promise<void> {
+        // Construct source path by prepending FILES_VOLUME
+        const sourcePath = path.startsWith('/') ? `${this.config.filesPath}${path}` : `${this.config.filesPath}/${path}`;
+
+        if (action === 'delete') {
+            // Find and remove file by source path
+            const virtualPath = this.sourcePathToVirtualPath.get(sourcePath);
+            if (virtualPath) {
+                this.removeFile(virtualPath);
+                logger.debug(`File deleted: ${virtualPath}`);
+            }
+            return;
+        }
+
+        if (action === 'rename' && oldPath) {
+            // Remove old file first
+            const oldSourcePath = oldPath.startsWith('/') ? `${this.config.filesPath}${oldPath}` : `${this.config.filesPath}/${oldPath}`;
+            const oldVirtualPath = this.sourcePathToVirtualPath.get(oldSourcePath);
+            if (oldVirtualPath) {
+                this.removeFile(oldVirtualPath);
+            }
+            // Fall through to add the renamed file
+        }
+
+        // For add/change/rename: Look up metadata in Redis by path
+        // We need to find the hashId for this path, then get the full metadata
+        const files = await this.redisClient.getAllFiles();
+        const metadata = files.get(sourcePath);
+
+        if (!metadata) {
+            // File exists on disk but not yet processed (metadata not in Redis)
+            // This is expected - meta-core detects files before meta-sort processes them
+            logger.debug(`File not yet in Redis: ${sourcePath}`);
+            return;
+        }
+
+        // Compute virtual path for this file
+        const virtualPath = this.computeVirtualPath(metadata, sourcePath);
+
+        if (!virtualPath) {
+            logger.debug(`Could not compute virtual path for: ${sourcePath}`);
+            return;
+        }
+
+        // If updating, remove old entry first
+        if (action === 'change') {
+            const oldVirtualPath = this.sourcePathToVirtualPath.get(sourcePath);
+            if (oldVirtualPath && oldVirtualPath !== virtualPath) {
+                this.removeFile(oldVirtualPath);
+            }
+        }
+
+        // Add/update file
+        await this.addFile(virtualPath, metadata);
+        this.sourcePathToVirtualPath.set(sourcePath, virtualPath);
+
+        logger.debug(`File ${action}: ${virtualPath}`);
+    }
+
+    /**
+     * Handle incremental file update from pub/sub (legacy, hashId-based)
      * Adds or updates a single file without full rebuild
      */
     async onFileUpdate(hashId: string, action: 'add' | 'update' | 'remove'): Promise<void> {

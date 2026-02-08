@@ -17,11 +17,19 @@ const logger = new Logger({ name: 'RedisClient' });
 
 /**
  * Stream message from Redis Streams
+ * File events from meta-core: add, change, delete, rename
+ * Legacy events from meta-sort: batch, reset, plugin:complete
  */
 export interface StreamMessage {
     id: string;
-    type: 'batch' | 'reset' | 'plugin:complete';
-    payload: string;
+    type: 'add' | 'change' | 'delete' | 'rename' | 'batch' | 'reset' | 'plugin:complete';
+    // Direct file event fields (from meta-core)
+    path?: string;
+    size?: string;
+    partialHash?: string;
+    oldPath?: string;
+    // Legacy payload field (for backward compatibility)
+    payload?: string;
     timestamp: string;
 }
 
@@ -477,7 +485,7 @@ export class RedisClient implements Partial<IKVClient> {
      * Initialize stream consumer group
      * Creates the consumer group at position 0 to read all historical events
      *
-     * @param stream - Stream name (e.g., 'meta-sort:events')
+     * @param stream - Stream name (e.g., 'file:events')
      * @param group - Consumer group name (e.g., 'meta-fuse-vfs')
      */
     async initStreamConsumer(stream: string, group: string): Promise<void> {
@@ -668,20 +676,39 @@ export class RedisClient implements Partial<IKVClient> {
      * Parse a stream entry into a StreamMessage
      */
     private parseStreamEntry(id: string, fields: string[]): StreamMessage | null {
-        // Fields come as flat array: ['type', 'batch', 'payload', '...', 'timestamp', '123']
+        // Fields come as flat array: ['type', 'add', 'path', '...', 'timestamp', '123']
         const fieldMap: Record<string, string> = {};
         for (let i = 0; i < fields.length; i += 2) {
             fieldMap[fields[i]] = fields[i + 1];
         }
 
-        if (!fieldMap.type || !fieldMap.payload) {
-            logger.warn(`Invalid stream entry ${id}: missing type or payload`);
+        if (!fieldMap.type) {
+            logger.warn(`Invalid stream entry ${id}: missing type`);
+            return null;
+        }
+
+        // For direct file events (add/change/delete/rename), path is required
+        // For legacy events (batch/reset/plugin:complete), payload is required
+        const directEventTypes = ['add', 'change', 'delete', 'rename'];
+        const isDirectEvent = directEventTypes.includes(fieldMap.type);
+
+        if (isDirectEvent && !fieldMap.path) {
+            logger.warn(`Invalid stream entry ${id}: missing path for ${fieldMap.type} event`);
+            return null;
+        }
+
+        if (!isDirectEvent && !fieldMap.payload) {
+            logger.warn(`Invalid stream entry ${id}: missing payload for ${fieldMap.type} event`);
             return null;
         }
 
         return {
             id,
             type: fieldMap.type as StreamMessage['type'],
+            path: fieldMap.path,
+            size: fieldMap.size,
+            partialHash: fieldMap.partialHash,
+            oldPath: fieldMap.oldPath,
             payload: fieldMap.payload,
             timestamp: fieldMap.timestamp || '0',
         };
