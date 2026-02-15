@@ -166,8 +166,20 @@ async function main(): Promise<void> {
             );
 
             const bootstrapTime = Date.now() - bootstrapStart;
-            const stats = vfs.getStats();
+            let stats = vfs.getStats();
             logger.info(`Streaming bootstrap complete: ${stats.fileCount} files in ${bootstrapTime}ms`);
+
+            // Fallback: If stream was empty but Redis has files, bootstrap from Redis keys
+            // This handles the case where meta-core restarted and cleared the stream
+            if (stats.fileCount === 0) {
+                const indexCount = await redisClient.getIndexCount();
+                if (indexCount > 0) {
+                    logger.info(`Stream was empty but Redis has ${indexCount} files - bootstrapping from Redis keys...`);
+                    await vfs.refresh();
+                    stats = vfs.getStats();
+                    logger.info(`Redis key bootstrap complete: ${stats.fileCount} files`);
+                }
+            }
 
             // Start live stream consumer from where replay left off
             logger.info(`Starting live stream consumer from ${lastId}...`);

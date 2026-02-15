@@ -446,6 +446,24 @@ export class RedisClient implements Partial<IKVClient> {
     }
 
     /**
+     * Get count of files in Redis index
+     * More efficient than getAllHashIds() when you only need the count
+     */
+    async getIndexCount(): Promise<number> {
+        if (!this.client || !this.isConnected) {
+            return 0;
+        }
+
+        try {
+            const indexKey = `${this.config.prefix}file:__index__`;
+            return await this.client.scard(indexKey);
+        } catch (error) {
+            logger.error('Failed to get index count:', error);
+            return 0;
+        }
+    }
+
+    /**
      * Scan Redis keys matching pattern
      */
     private async scanKeys(pattern: string): Promise<string[]> {
