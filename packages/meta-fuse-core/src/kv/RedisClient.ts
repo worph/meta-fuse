@@ -464,6 +464,76 @@ export class RedisClient implements Partial<IKVClient> {
     }
 
     /**
+     * Scan flat keys to build file metadata for all indexed files
+     * This is used as a fallback when the meta:events stream is empty or unavailable.
+     *
+     * Algorithm:
+     * 1. Get all hash IDs from the index
+     * 2. For each hash ID, fetch VFS-relevant properties using MGET
+     * 3. Return a Map of hashId to flat properties
+     *
+     * This replaces the broken getAllFiles() which used HGETALL on flat keys.
+     *
+     * @param vfsRelevantProperties - Set of property names that are VFS-relevant
+     * @returns Map of hashId to properties (only files with filePath)
+     */
+    async scanFlatKeysForFiles(vfsRelevantProperties: Set<string>): Promise<Map<string, Record<string, string>>> {
+        const result = new Map<string, Record<string, string>>();
+
+        if (!this.client || !this.isConnected) {
+            logger.warn('Redis not connected, returning empty result');
+            return result;
+        }
+
+        try {
+            // Get all hash IDs from the index
+            const hashIds = await this.getAllHashIds();
+            logger.info(`Scanning flat keys for ${hashIds.length} files...`);
+
+            if (hashIds.length === 0) {
+                return result;
+            }
+
+            // Batch process hashIds to avoid overwhelming Redis
+            const batchSize = 100;
+            const propertiesArray = Array.from(vfsRelevantProperties);
+
+            for (let i = 0; i < hashIds.length; i += batchSize) {
+                const batch = hashIds.slice(i, i + batchSize);
+
+                // Process each hashId in the batch
+                const batchPromises = batch.map(async (hashId) => {
+                    const props = await this.getProperties(hashId, propertiesArray);
+
+                    // Only include files that have a filePath
+                    if (props.has('filePath')) {
+                        const propsObj: Record<string, string> = {};
+                        for (const [key, value] of props) {
+                            propsObj[key] = value;
+                        }
+                        return { hashId, props: propsObj };
+                    }
+                    return null;
+                });
+
+                const batchResults = await Promise.all(batchPromises);
+
+                for (const item of batchResults) {
+                    if (item) {
+                        result.set(item.hashId, item.props);
+                    }
+                }
+            }
+
+            logger.info(`Flat key scan complete: ${result.size} files with filePath`);
+            return result;
+        } catch (error: any) {
+            logger.error('Failed to scan flat keys:', error.message);
+            return result;
+        }
+    }
+
+    /**
      * Scan Redis keys matching pattern
      */
     private async scanKeys(pattern: string): Promise<string[]> {

@@ -2,7 +2,7 @@
 
 ## Overview
 
-This document describes the architecture and design philosophy for the Virtual Filesystem (VFS) rebuild process in MetaMesh. The system uses a **two-phase strategy** to provide fast startup times while maintaining data accuracy through continuous validation.
+This document describes the architecture and design philosophy for the Virtual Filesystem (VFS) rebuild process in MetaMesh. The system uses a **streaming-based strategy** with Redis Streams to provide fast startup times while maintaining data accuracy through event-driven updates.
 
 ## Design Philosophy
 
@@ -10,276 +10,242 @@ The VFS rebuild architecture is built on three core principles:
 
 | Component | Role | Responsibility |
 |-----------|------|----------------|
-| **etcd** | Distributed Metadata Archive | Permanent record of all files (even if deleted from disk) |
-| **In-Memory Database** | Current VFS State | Only files present on disk RIGHT NOW |
-| **Discovery** | Source of Truth | Validates file existence and cleans stale entries |
+| **Redis** | Metadata Storage | Flat key storage of all file properties |
+| **Redis Streams** | Event Log | Ordered record of all metadata changes (`meta:events`) |
+| **StreamingStateBuilder** | State Manager | Processes events, maintains VFS-relevant state in memory |
 
 ### Key Insight
 
-> **etcd stores the historical truth** (what files have existed)
-> **In-memory DB stores the current truth** (what files exist NOW)
-> **Discovery enforces reality** (makes memory match disk state)
+> **Redis stores the current truth** (what file properties exist)
+> **Redis Streams store the change log** (what changed and when)
+> **StreamingStateBuilder filters and projects** (extracts only VFS-relevant properties)
 
 This separation enables:
-- **Fast cold starts** (1-2 seconds for 10,000 files)
-- **Distributed metadata sharing** via meta-orbit (etcd never deletes)
-- **Accurate VFS state** (discovery continuously validates)
-- **Graceful handling of offline storage** (network drives, removable media)
+- **Fast cold starts** (1-2 seconds for 10,000 files via stream replay)
+- **Memory efficiency** (~500 bytes/file, only VFS-relevant properties)
+- **Real-time updates** (live stream consumption after bootstrap)
+- **Graceful handling of offline storage** (state rebuilds on reconnection)
 
 ---
 
-## Two-Phase Strategy
+## Streaming Architecture
 
-### Phase 1: Fast Bootstrap (Startup)
+### Phase 1: Streaming Bootstrap (Startup)
 
-**Goal**: Make VFS available as quickly as possible
+**Goal**: Rebuild VFS state as quickly as possible from event stream
 
-**Implementation**: `WatchedFileProcessor.rebuildVFSFromEtcd()`
+**Implementation**: See `index.ts:158-174`
 
 ```typescript
-async rebuildVFSFromEtcd(): Promise<void> {
-    // 1. Fetch all hash IDs from etcd
-    const hashIds = await etcdClient.getAllHashIds();
+// Bootstrap: Replay meta:events stream from position 0
+const lastId = await redisClient.replayStream(
+    EVENTS_STREAM,            // 'meta:events'
+    '0',                      // Start from beginning
+    async (message: StreamMessage) => {
+        await stateBuilder.processEvent(message);
+    },
+    100                       // Batch size
+);
 
-    // 2. Batch fetch ALL metadata in parallel (no disk I/O)
-    const metadataList = await Promise.all(
-        hashIds.map(hashId => etcdClient.getMetadataFlat(hashId))
-    );
-
-    // 3. Load into in-memory DB without validation
-    for (const metadata of metadataList) {
-        metadata._lastVerified = 0; // Mark as unverified
-        this.fileProcessor.getDatabase().set(metadata.filePath, metadata);
-    }
-
-    // 4. Build VFS immediately (1-2 seconds)
-    await this.finalize();
-}
+const stats = vfs.getStats();
+logger.info(`Streaming bootstrap complete: ${stats.fileCount} files`);
 ```
+
+**How It Works**:
+1. Read stream entries in batches using `XREAD`
+2. For each `set` event, check if property is VFS-relevant
+3. If relevant, fetch property value with `GET file:{hashId}/{property}`
+4. Update in-memory state and notify VFS when file has `filePath`
 
 **Performance**:
-- 10,000 files: ~1-2 seconds (previously 60+ seconds)
-- Zero disk I/O during startup
-- VFS immediately usable (may contain stale entries)
+- 10,000 files: ~1-2 seconds
+- Zero SCAN/HGETALL operations
+- Only fetches properties needed for VFS path computation
 
 **Characteristics**:
-- ✅ Fast startup
-- ✅ No blocking on disk validation
-- ✅ All files appear immediately
-- ⚠️ May include deleted/offline files temporarily
+- Stream replay from position 0
+- Incremental state building
+- VFS populated as files become "complete" (have `filePath`)
 
 ---
 
-### Phase 2: Continuous Validation (Discovery)
+### Phase 2: Live Stream Consumption
 
-**Goal**: Make in-memory DB match current disk reality
+**Goal**: Keep VFS synchronized with metadata changes in real-time
 
-**Implementation**: Discovery scans folders progressively and validates file existence
-
-```typescript
-// Progressive scan: Process folders one at a time
-for (const folder of folderList) {
-    const discoveredFilesInFolder = new Set<string>();
-
-    // Track discovered files for this folder
-    async function* trackDiscoveredFiles(stream: AsyncGenerator<string>) {
-        for await (const filePath of stream) {
-            discoveredFilesInFolder.add(filePath);  // Track what exists
-            yield filePath;
-        }
-    }
-
-    const discoveryStream = folderWatcher.discoverFiles([folder]);
-    await pipeline.start(trackDiscoveredFiles(discoveryStream));
-
-    // Progressive cleanup: Remove stale entries after each folder
-    await fileProcessor.cleanupStaleEntries([folder], discoveredFilesInFolder);
-}
-```
-
-**Cleanup Logic**: `WatchedFileProcessor.cleanupStaleEntries()`
+**Implementation**: See `index.ts:177-187`
 
 ```typescript
-async cleanupStaleEntries(scannedFolders: string[], discoveredFiles: Set<string>) {
-    for (const folder of scannedFolders) {
-        // Find all in-memory files for this folder
-        const filesToCheck = db.getAllFilesStartingWith(folder);
-
-        // Remove files not seen during scan
-        for (const filePath of filesToCheck) {
-            if (!discoveredFiles.has(filePath)) {
-                // File no longer exists → remove from memory
-                db.delete(filePath);
-                vfs.removeFileByRealPath(filePath);
-                stateManager.removeFile(filePath);
-            }
-        }
-    }
-
-    // Rebuild VFS if anything changed
-    await this.finalize();
-}
-```
-
-**Validation Rules** (applied progressively per folder):
-
-| Scenario | Action | VFS Update |
-|----------|--------|------------|
-| File found during scan | Update `_lastVerified` timestamp, keep in memory | No change |
-| File not found in scanned folder | Remove from in-memory DB, keep in etcd | VFS rebuilt incrementally |
-| Empty folder scanned | Remove ALL child paths from memory immediately | VFS rebuilt (files disappear) |
-| Folder missing/inaccessible | Remove ALL child paths from memory immediately | VFS rebuilt (files disappear) |
-
-**Key Behavior**: When a NAS/network drive is disconnected (folder becomes empty/inaccessible), all files from that folder are **progressively removed from the VFS as discovery proceeds** through each folder.
-
-**Characteristics**:
-- ✅ Discovery is authoritative
-- ✅ Progressive cleanup (files disappear as folders are scanned)
-- ✅ Handles deleted files automatically
-- ✅ Handles offline network drives (files removed immediately when folder is scanned)
-- ✅ No manual TTL/expiry needed
-- ✅ Real-time VFS updates during discovery
-
----
-
-## Architecture Comparison
-
-### Old Approach (Disk Validation at Startup)
-
-```
-┌─────────────────────────────────────────────┐
-│ Startup: rebuildVFSFromEtcd()              │
-│                                             │
-│ For each file in etcd (sequential):        │
-│   1. Fetch metadata from etcd (1-5ms)      │
-│   2. Check if file exists (fs.access)      │
-│      - Local disk: 1-10ms                  │
-│      - Network drive: 10-100ms             │
-│   3. Add to memory if exists               │
-│                                             │
-│ Result: 60-120 seconds for 10k files       │
-└─────────────────────────────────────────────┘
-```
-
-**Problems**:
-- ❌ Slow startup (blocks on disk I/O)
-- ❌ Sequential processing (no parallelization)
-- ❌ Network latency multiplies wait time
-- ❌ VFS unavailable during validation
-
-### New Approach (Fast Load + Progressive Discovery)
-
-```
-┌─────────────────────────────────────────────┐
-│ Startup: rebuildVFSFromEtcd()              │
-│                                             │
-│ 1. Batch fetch ALL metadata (parallel)     │
-│    → 10k files in ~500ms                   │
-│                                             │
-│ 2. Load into memory (no disk checks)       │
-│    → 10k files in ~200ms                   │
-│                                             │
-│ 3. Build VFS                                │
-│    → Ready in 1-2 seconds total            │
-│                                             │
-│ Result: VFS immediately usable              │
-└─────────────────────────────────────────────┘
-
-┌─────────────────────────────────────────────┐
-│ Background: Progressive Discovery Scan      │
-│                                             │
-│ For each folder in watch list:             │
-│   1. Walk folder and track discovered files│
-│   2. Update _lastVerified for found files  │
-│   3. Remove stale entries for this folder  │
-│   4. Rebuild VFS (files disappear)         │
-│   5. Move to next folder                   │
-│                                             │
-│ Result: Files progressively disappear as   │
-│         folders are scanned (real-time)    │
-└─────────────────────────────────────────────┘
-```
-
-**Benefits**:
-- ✅ 10-50x faster startup
-- ✅ Parallel etcd fetching
-- ✅ No disk I/O blocking
-- ✅ VFS immediately available
-- ✅ Progressive cleanup (real-time feedback)
-- ✅ Files disappear as folders are scanned
-
----
-
-## Implementation Details
-
-### File Metadata Structure
-
-```typescript
-interface FileMetadata {
-    filePath: string;
-    cid_midhash256: string;  // Permanent file ID
-    title: string;
-    // ... other metadata fields
-
-    // Validation tracking (optional)
-    _lastVerified?: number;  // Timestamp of last disk validation
-}
-```
-
-The `_lastVerified` field:
-- Set to `0` during fast load (unverified)
-- Updated to `Date.now()` when discovery sees the file
-- Used for debugging and monitoring (not enforced)
-
-### State Management
-
-**In-Memory Database** (`FileProcessor.database`):
-- `Map<filePath, metadata>`
-- Cleared on restart
-- Reflects only currently accessible files
-
-**etcd Storage**:
-- `/file/midhash256:{hash}/property` - Permanent metadata
-- Never deleted (even if file removed from disk)
-- Shared across meta-orbit network
-
-**Virtual Filesystem** (`VirtualFileSystem`):
-- Generated from in-memory database
-- Rebuilt after cleanup operations
-- Accessible via FUSE/WebDAV
-
-### Discovery Integration
-
-Discovery runs in two modes:
-
-**1. Manual Scan** (startup or triggered via API) - Progressive:
-```typescript
-// Process folders one at a time
-for (const folder of folderList) {
-    const discoveredFiles = new Set<string>();
-    const discoveryStream = folderWatcher.discoverFiles([folder]);
-
-    // Track and process files for this folder
-    await pipeline.start(trackFiles(discoveryStream, discoveredFiles));
-
-    // Progressive cleanup: Remove stale entries immediately
-    await fileProcessor.cleanupStaleEntries([folder], discoveredFiles);
-    // → VFS rebuilt, files from disconnected NAS disappear
-}
-```
-
-**2. Watch Mode** (continuous monitoring):
-```typescript
-folderWatcher.watch(folderList, {
-    onAdd: (filePath) => {
-        // File added → process and add to memory
-        pipeline.processFile(filePath);
+// Start live stream consumer from where replay left off
+redisClient.startSimpleStreamConsumer(
+    EVENTS_STREAM,
+    lastId,                   // Resume from bootstrap position
+    async (message: StreamMessage) => {
+        await stateBuilder.processEvent(message);
     },
-    onUnlink: (filePath) => {
-        // File removed → remove from memory immediately
-        fileProcessor.deleteFile(filePath);
+    5000                      // 5 second block timeout
+);
+```
+
+**Event Processing** (see `StreamingStateBuilder.ts:123-136`):
+
+```typescript
+async processEvent(message: StreamMessage): Promise<void> {
+    // Handle new meta:events format (set/del with key field)
+    if ((message.type === 'set' || message.type === 'del') && message.key) {
+        await this.processMetaEvent(message);
+        return;
     }
-});
+    // Legacy events ignored
+}
+```
+
+**Property Filtering** (see `RulesPropertyExtractor.ts`):
+
+```typescript
+// Only fetch VFS-relevant properties
+if (!isVfsRelevantProperty(property, this.vfsRelevantProps)) {
+    this.stats.propertiesSkipped++;
+    return;
+}
+
+// Fetch and update state
+const value = await this.redisClient.getProperty(hashId, property);
+this.updateProperty(hashId, property, value);
+```
+
+---
+
+## Architecture Diagrams
+
+### Startup Sequence
+
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│                     Streaming Bootstrap                                  │
+├─────────────────────────────────────────────────────────────────────────┤
+│                                                                          │
+│  1. Initialize KVManager (leader discovery)                             │
+│     ├── Read /meta-core/locks/kv-leader.info                           │
+│     ├── Call /urls API for Redis URL                                    │
+│     └── Connect to Redis                                                 │
+│                                                                          │
+│  2. Create StreamingStateBuilder                                         │
+│     ├── Extract VFS-relevant properties from rules                      │
+│     └── Wire up VFS callback                                            │
+│                                                                          │
+│  3. Replay meta:events stream from position 0                           │
+│     ┌────────────────────────────────────────────────────────────┐     │
+│     │  For each event in stream:                                  │     │
+│     │    ├── Parse key: file:{hashId}/{property}                 │     │
+│     │    ├── Check if property is VFS-relevant                   │     │
+│     │    ├── If yes: GET property value                          │     │
+│     │    ├── Update in-memory state                              │     │
+│     │    └── If file has filePath: notify VFS (file appears)    │     │
+│     └────────────────────────────────────────────────────────────┘     │
+│                                                                          │
+│  4. Start live consumer from last processed ID                          │
+│     └── Continue processing new events in real-time                     │
+│                                                                          │
+│  5. Start API server                                                     │
+│     └── VFS ready for FUSE/WebDAV operations                            │
+│                                                                          │
+└─────────────────────────────────────────────────────────────────────────┘
+```
+
+### Event Processing Pipeline
+
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│                     Event Processing Pipeline                            │
+├─────────────────────────────────────────────────────────────────────────┤
+│                                                                          │
+│  Redis Stream (meta:events)                                              │
+│  ┌──────────────────────────────────────────────────────────────┐       │
+│  │ {id: "1234-0", type: "set", key: "file:abc123/title"}        │       │
+│  │ {id: "1234-1", type: "set", key: "file:abc123/filePath"}     │       │
+│  │ {id: "1234-2", type: "del", key: "file:xyz789/filePath"}     │       │
+│  └───────────────────────────────┬──────────────────────────────┘       │
+│                                  │                                       │
+│                                  ▼                                       │
+│  ┌─────────────────────────────────────────────────────────────┐        │
+│  │ StreamingStateBuilder.processEvent()                         │        │
+│  │   1. Parse key → {hashId: "abc123", property: "title"}       │        │
+│  │   2. Check VFS relevance (from RulesPropertyExtractor)       │        │
+│  │   3. If relevant: GET file:abc123/title → "Inception"        │        │
+│  │   4. Update state: state.get("abc123").set("title", ...)     │        │
+│  └─────────────────────────────────────────────────────────────┘        │
+│                                  │                                       │
+│                                  ▼                                       │
+│  ┌─────────────────────────────────────────────────────────────┐        │
+│  │ VFSUpdateCallback                                            │        │
+│  │   - onPropertyChange(hashId, property, value)                │        │
+│  │   - onFileComplete(hashId, metadata) → file appears in VFS  │        │
+│  │   - onFileDelete(hashId) → file removed from VFS            │        │
+│  └─────────────────────────────────────────────────────────────┘        │
+│                                                                          │
+└─────────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## State Management
+
+### StreamingStateBuilder State
+
+```typescript
+// FilesState: Map of hashId to property map
+type FileState = Map<string, string>;      // property → value
+type FilesState = Map<string, FileState>;  // hashId → properties
+
+// Example state
+{
+    "abc123": {
+        "filePath": "watch/Movies/Inception.mkv",
+        "title": "Inception",
+        "year": "2010",
+        "size": "4831838208"
+    },
+    "xyz789": {
+        "filePath": "watch/TV/Breaking Bad/S01E01.mkv",
+        "title": "Breaking Bad",
+        "season": "1",
+        "episode": "1"
+    }
+}
+```
+
+### VFS-Relevant Properties
+
+Properties are extracted from renaming rules (see `RulesPropertyExtractor.ts`):
+
+**Core Properties** (always required):
+- `filePath` - Source file location (required for file to appear)
+- `size`, `fileSize` - File size
+- `mtime`, `ctime` - Timestamps
+- `fileName`, `extension` - Filename components
+
+**Rule-Derived Properties**:
+- From templates: `{title}`, `{season:pad2}`, `{episode:pad2}`
+- From conditions: `{ field: 'fileType', value: 'video' }`
+
+### Redis Data Structure
+
+```
+# Flat key format
+file:{hashId}/{property}  →  value
+
+# Examples
+file:abc123/filePath      →  "watch/Movies/Inception.mkv"
+file:abc123/title         →  "Inception"
+file:abc123/titles/eng    →  "Inception"  (nested property)
+file:abc123/year          →  "2010"
+
+# Index
+file:__index__            →  SET["abc123", "xyz789", ...]
+
+# Event stream
+meta:events               →  Stream of {type, key, ts} events
 ```
 
 ---
@@ -288,74 +254,92 @@ folderWatcher.watch(folderList, {
 
 ### Startup Performance
 
-| Dataset Size | Old Approach | New Approach | Speedup |
-|--------------|-------------|--------------|---------|
-| 1,000 files | 5-10s | 0.5-1s | 10x |
-| 10,000 files | 60-120s | 1-2s | 60x |
-| 100,000 files | 10-20m | 10-15s | 60-80x |
-
-### Storage Type Impact
-
-| Storage Type | Old Approach | New Approach | Notes |
-|--------------|-------------|--------------|-------|
-| Local SSD | 5-10s | 1-2s | Validation was fast, but sequential |
-| Local HDD | 20-40s | 1-2s | Seek time penalty eliminated |
-| Network (NFS/SMB) | 60-300s | 1-2s | Latency eliminated from startup |
-| Offline/Slow Network | Timeout/Fail | 1-2s | Gracefully handles offline storage |
+| Dataset Size | Streaming Bootstrap | Notes |
+|--------------|---------------------|-------|
+| 1,000 files | 0.5-1s | Stream replay + selective GET |
+| 10,000 files | 1-2s | Batch processing (100 events) |
+| 100,000 files | 10-15s | Memory-efficient incremental build |
 
 ### Memory Usage
 
-- **In-Memory DB**: ~500 bytes/file (metadata only)
+- **Per-file overhead**: ~500 bytes (only VFS-relevant properties)
 - **10,000 files**: ~5 MB
 - **100,000 files**: ~50 MB
-- **Negligible overhead** compared to old approach
+- **Comparison**: Previous HGETALL approach loaded all properties (~2-5KB/file)
+
+### Why Streaming is Fast
+
+| Old Approach | New Approach |
+|--------------|--------------|
+| `SCAN file:*` to find all keys | `XREAD meta:events` from position 0 |
+| `HGETALL file:{id}` for each file | `GET file:{id}/{prop}` only for relevant props |
+| All properties loaded | Only VFS-relevant properties |
+| O(n × m) where m = all properties | O(n × k) where k = relevant properties |
 
 ---
 
 ## Handling Edge Cases
 
+### New Files
+
+1. meta-sort processes file, writes properties to Redis
+2. meta-sort publishes `set` events to `meta:events` stream
+3. meta-fuse consumes events, fetches relevant properties
+4. When `filePath` is set, file appears in VFS
+
 ### Deleted Files
 
-**Scenario**: User deletes a file after startup but before discovery scans
+1. meta-sort publishes `del file:{hashId}/filePath` event
+2. meta-fuse processes event, removes file from state
+3. VFS updated, file disappears
 
-**Old Behavior**: File appears in VFS until next full rebuild
+### Redis Reconnection
 
-**New Behavior**:
-1. Fast load: File appears in VFS (loaded from etcd)
-2. Discovery scan: File not found → removed from memory
-3. VFS rebuilt without the file
-4. etcd still has metadata (for meta-orbit sharing)
+1. Connection lost, stream consumer stops
+2. KVManager detects disconnect, attempts reconnect
+3. On reconnect, can replay stream from last position
+4. State incrementally updated with missed events
 
-### Offline Network Drives
+### VFS Refresh
 
-**Scenario**: NFS mount becomes unavailable
+Triggered via `POST /api/fuse/refresh`:
 
-**Old Behavior**: Startup hangs or fails with timeout
+```typescript
+// Fallback for when stream is unavailable
+async refresh(): Promise<void> {
+    // Use flat key scanning fallback
+    const files = await redisClient.scanFlatKeysForFiles(
+        stateBuilder.getVfsRelevantProperties()
+    );
+    // Rebuild VFS from scanned data
+}
+```
 
-**New Behavior**:
-1. Fast load: All files appear in VFS (1-2s)
-2. Discovery scan: Folder inaccessible → removes all child paths
-3. When drive comes back online: Next discovery re-adds files
+---
 
-### Moved Files
+## VFSUpdateCallback Interface
 
-**Scenario**: User moves file outside watch folders
+The VFS implements this callback interface to receive updates from StreamingStateBuilder:
 
-**Old Behavior**: File appears in VFS until manual cleanup
+```typescript
+interface VFSUpdateCallback {
+    // Property changed for a file
+    onPropertyChange(hashId: string, property: string, value: string): void;
 
-**New Behavior**:
-1. Discovery scans old location → file not found → removed from memory
-2. If moved within watch folders: Discovered as new file
-3. etcd has both old and new paths (deduplication via midhash256)
+    // Property deleted from a file
+    onPropertyDelete(hashId: string, property: string): void;
 
-### Partial Scans
+    // File completely removed (filePath deleted)
+    onFileDelete(hashId: string): void;
 
-**Scenario**: Discovery interrupted mid-scan (crash, kill signal)
+    // File has all required properties, ready to appear in VFS
+    onFileComplete(hashId: string, metadata: Record<string, string>): void;
+}
+```
 
-**Safety**: Cleanup only runs after scan completes successfully
-- Incomplete scan → no cleanup
-- Memory state unchanged
-- Next scan will complete and clean up
+The `onFileComplete` callback is called when:
+1. A file first receives a `filePath` property
+2. Subsequent property changes after file is already complete
 
 ---
 
@@ -364,164 +348,64 @@ folderWatcher.watch(folderList, {
 ### Startup Logs
 
 ```
-[VFS Rebuild] Starting fast-load from etcd...
-[VFS Rebuild] Found 10000 files in etcd
-[VFS Rebuild] Fetching metadata in parallel...
-[VFS Rebuild] Loaded 9856/10000 files into memory (unverified)
-[VFS Rebuild] VFS rebuilt in 1523ms
-[VFS Rebuild] Discovery will validate file existence in background
+[meta-fuse] Starting meta-fuse...
+[KVManager] Waiting for leader...
+[LeaderClient] Leader found: meta-core-dev at redis://meta-core:6379
+[meta-fuse] KV Manager ready, initializing VFS with streaming bootstrap...
+[StreamingStateBuilder] Initialized with 12 VFS-relevant properties
+[meta-fuse] Replaying meta:events stream from position 0...
+[RedisClient] Stream replay complete: 15234 entries in 1823ms
+[meta-fuse] Streaming bootstrap complete: 5123 files in 1893ms
+[meta-fuse] Starting live stream consumer from 1703808000000-0...
+[meta-fuse] meta-fuse is ready!
+[meta-fuse] VFS: 5123 files, 847 directories
+[meta-fuse] State builder: 15234 events, 8934 properties fetched, 6300 skipped
 ```
 
-### Discovery Logs (Progressive Mode)
-
-```
-[Discovery] Progressive scan mode: 3 folders
-[Discovery] Scanning folder: /data/watch/local
-[Discovery] Folder scan complete: /data/watch/local. Found 128 files. Running cleanup...
-[Cleanup] Starting cleanup for 1 scanned folders...
-[Cleanup] Removed 0 stale entries in 2ms
-[Cleanup] Cleanup complete for folder: /data/watch/local
-
-[Discovery] Scanning folder: /data/watch/smb-nas
-[Discovery] Folder scan complete: /data/watch/smb-nas. Found 0 files. Running cleanup...
-[Cleanup] Starting cleanup for 1 scanned folders...
-[Cleanup] Removed stale entry: /data/watch/smb-nas/Movies/deleted_movie.mkv
-[Cleanup] Removed stale entry: /data/watch/smb-nas/Movies/another_movie.mkv
-[Cleanup] Removed 13621 stale entries in 87ms
-[Cleanup] Rebuilding VFS after cleanup...
-Virtual filesystem update start
-Duplicate find took 1ms - found 0 hash groups, 21 title groups
-Generating virtual structure for 128 files
-Virtual filesystem update took 167ms
-[Cleanup] Cleanup complete for folder: /data/watch/smb-nas
-
-[Discovery] Scanning folder: /data/watch/downloads
-[Discovery] Folder scan complete: /data/watch/downloads. Found 45 files. Running cleanup...
-[Cleanup] Starting cleanup for 1 scanned folders...
-[Cleanup] Removed 0 stale entries in 1ms
-[Cleanup] Cleanup complete for folder: /data/watch/downloads
-
-[Discovery] All folders scanned and cleaned up
-```
-
-**Progressive Behavior**: Notice how the NAS folder (`/data/watch/smb-nas`) with 0 discovered files immediately triggers removal of 13,621 stale entries and VFS rebuild. Users see files disappear in real-time as each folder completes scanning.
-
-### API Endpoints
-
-Monitor VFS state via Unified API:
+### Stats API
 
 ```bash
-# VFS statistics
 curl http://localhost:3000/api/fuse/stats
-
-# Processing status
-curl http://localhost:3000/api/processing/status
-
-# Trigger manual scan + cleanup
-curl -X POST http://localhost:3000/api/scan/trigger
 ```
 
----
-
-## Best Practices
-
-### For Operators
-
-1. **Initial Startup**: First boot may show all historical files (even deleted ones)
-   - Wait for first discovery scan to clean up
-   - Or run manual scan: `POST /api/scan/trigger`
-
-2. **Network Drives**: If drives are slow or offline at startup
-   - VFS still loads in 1-2 seconds
-   - Files appear/disappear as drives come online/offline
-   - No manual intervention needed
-
-3. **Monitoring**: Watch for cleanup logs to understand disk changes
-   ```
-   [Cleanup] Removed 622 stale entries
-   ```
-   Large numbers indicate significant file deletions
-
-### For Developers
-
-1. **Adding New Metadata Sources**: Always update both:
-   - etcd (permanent record)
-   - In-memory DB (current state)
-
-2. **Testing Cleanup**: Simulate file deletions
-   ```bash
-   # Delete files from watch folder
-   rm -rf /data/watch/Movies/test_movie.mkv
-
-   # Trigger scan
-   curl -X POST http://localhost:3000/api/scan/trigger
-
-   # Verify cleanup in logs
-   docker logs meta-mesh-dev-container | grep Cleanup
-   ```
-
-3. **Performance Testing**: Benchmark with large datasets
-   ```bash
-   # Time startup
-   docker restart meta-mesh-dev-container
-   docker logs -f meta-mesh-dev-container | grep "VFS rebuilt"
-
-   # Time discovery + cleanup
-   time curl -X POST http://localhost:3000/api/scan/trigger
-   ```
-
----
-
-## Future Optimizations
-
-### Potential Improvements
-
-1. **Incremental Cleanup**: Instead of scanning all folders, track modified folders
-   - Use filesystem events (inotify) to detect folder changes
-   - Only clean up modified folders
-
-2. **Background Validation Queue**: Validate files lazily over time
-   - Prioritize recently accessed files
-   - Validate cold files during idle periods
-
-3. **Smart Caching**: Cache validation results
-   - LRU cache with TTL (5-10 minutes)
-   - Reduces redundant disk checks for frequently accessed files
-
-4. **Partial VFS Rebuild**: Only rebuild changed directories
-   - Track which folders had files removed
-   - Rebuild only affected VFS subtrees
-
-### Not Recommended
-
-❌ **TTL-based expiry**: Requires guessing timeout values, fails with slow scans
-
-❌ **Storing validation state in etcd**: Wrong tool for transient state, creates write amplification
-
-❌ **Immediate removal on unlink events**: Race conditions with discovery, inconsistent state
+```json
+{
+    "fileCount": 5123,
+    "directoryCount": 847,
+    "totalSize": 15847392847362,
+    "lastRefresh": "2024-01-15T10:30:00Z",
+    "stateBuilder": {
+        "eventsProcessed": 15234,
+        "propertiesFetched": 8934,
+        "propertiesSkipped": 6300,
+        "filesComplete": 5123,
+        "lastEventId": "1703808000000-0"
+    }
+}
+```
 
 ---
 
 ## Related Documentation
 
-- [Streaming Pipeline Architecture](streaming-pipeline-architecture.md) - File processing flow
-- [etcd Architecture](../../packages/meta-mesh/doc/architecture/etcd-architecture.md) - Storage design
-- [FUSE API](../../packages/meta-mesh/doc/architecture/fuse-api.md) - Virtual filesystem API
+- [Streaming Architecture](streaming-architecture.md) - Detailed streaming event processing
+- [API Reference](api-reference.md) - Complete API documentation
+- [meta-core Architecture](../../../meta-core/docs/architecture.md) - Leader election and Redis management
 
 ---
 
 ## Summary
 
-The VFS rebuild architecture achieves **10-50x faster startup** by separating concerns:
+The VFS rebuild architecture achieves **fast startup and real-time updates** through:
 
-- **etcd** = Permanent distributed metadata archive
-- **In-memory DB** = Current filesystem state
-- **Discovery** = Authoritative source of truth
+- **Redis Streams** = Ordered event log with replay capability
+- **StreamingStateBuilder** = Memory-efficient state projection
+- **Property Filtering** = Only VFS-relevant properties fetched
 
 This design enables:
-- ⚡ Sub-2-second cold starts (10k files)
-- 🔄 Continuous accuracy through discovery validation
-- 🌐 Distributed metadata sharing via meta-orbit
-- 📦 Graceful handling of offline/slow storage
+- Sub-2-second cold starts (10k files)
+- Real-time VFS updates via stream consumption
+- Memory-efficient state (~500 bytes/file)
+- Graceful reconnection and recovery
 
-The key insight: **Fast bootstrap + continuous validation > Blocking validation at startup**
+The key insight: **Stream replay + selective property fetching > Full scan + full data loading**

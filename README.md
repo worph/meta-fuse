@@ -92,30 +92,37 @@ Meta-Fuse is a read-only process in the MetaMesh ecosystem that:
 
 ### KV Leader Election
 
-All services in MetaMesh use a shared KV wrapper with leader election via flock(2):
+All services in MetaMesh use leader discovery via meta-core's lock file and HTTP API:
 
 ```
 /meta-core/locks/
-└── kv-leader.lock      # flock-based leader election + endpoint info
+├── kv-leader.lock      # flock-based leader election
+└── kv-leader.info      # Leader API URL (plain text)
 
-Lock File Format (JSON):
+Lock Info File Format (plain text):
+http://meta-core:9000
+
+/urls API Response (JSON):
 {
-  "host": "meta-sort-instance-1",
-  "api": "redis://10.0.1.50:6379",
-  "http": "http://10.0.1.50:3000",
-  "timestamp": 1703808000000,
-  "pid": 12345
+  "hostname": "meta-core-dev",
+  "baseUrl": "http://localhost:8083",
+  "apiUrl": "http://meta-core:9000",
+  "redisUrl": "redis://meta-core:6379",
+  "webdavUrl": "http://localhost:8083/webdav",
+  "webdavUrlInternal": "http://meta-core:9000/webdav",
+  "isLeader": true
 }
 
-Leader Election Flow:
-1. meta-sort attempts exclusive flock on kv-leader.lock
-2. Winner (leader) spawns Redis, writes endpoint to lock file
-3. meta-fuse reads lock file to discover Redis endpoint
-4. meta-fuse connects as read-only client
-5. On leader failure, flock auto-releases, new leader elected
+Leader Discovery Flow:
+1. meta-core acquires flock on kv-leader.lock
+2. Winner (leader) spawns Redis, writes API URL to kv-leader.info
+3. meta-fuse reads kv-leader.info to find API URL
+4. meta-fuse calls /urls API to get Redis URL and other endpoints
+5. meta-fuse connects to Redis as read-only client
+6. On leader failure, flock auto-releases, new leader elected
 ```
 
-**Note**: meta-fuse never becomes leader - it only reads the lock file to discover the active Redis endpoint managed by meta-sort.
+**Note**: meta-fuse never becomes leader - it reads the lock file and calls the /urls API to discover the active Redis endpoint managed by meta-core.
 
 ## Core Features
 
@@ -150,15 +157,26 @@ meta-fuse/
 │   │   ├── src/
 │   │   │   ├── api/            # Fastify REST API (APIServer)
 │   │   │   │   └── APIServer.ts
+│   │   │   ├── config/         # Configuration management
+│   │   │   │   └── ConfigStorage.ts
 │   │   │   ├── kv/             # KV client wrapper (FOLLOWER mode only)
 │   │   │   │   ├── IKVClient.ts        # Read-only interface
 │   │   │   │   ├── KVManager.ts        # Leader discovery, connection management
-│   │   │   │   ├── LeaderDiscovery.ts  # Lock file reading
-│   │   │   │   └── RedisClient.ts      # Redis connection with pub/sub
+│   │   │   │   ├── LeaderClient.ts     # Lock file reading + /urls API
+│   │   │   │   ├── RedisClient.ts      # Redis connection with Streams support
+│   │   │   │   └── ServiceDiscovery.ts # Service discovery client
 │   │   │   ├── vfs/            # Virtual filesystem logic
-│   │   │   │   ├── VirtualFileSystem.ts    # In-memory VFS representation
-│   │   │   │   ├── MetaDataToFolderStruct.ts # Folder organization
-│   │   │   │   └── RenamingRule.ts     # Virtual path rules
+│   │   │   │   ├── VirtualFileSystem.ts       # In-memory VFS representation
+│   │   │   │   ├── StreamingStateBuilder.ts   # Event-driven state management
+│   │   │   │   ├── RulesPropertyExtractor.ts  # Property filtering from rules
+│   │   │   │   ├── MetaDataToFolderStruct.ts  # Folder organization
+│   │   │   │   ├── RenamingRule.ts            # Virtual path rules
+│   │   │   │   ├── defaults/                  # Default renaming rules
+│   │   │   │   ├── template/                  # Template engine components
+│   │   │   │   │   ├── TemplateEngine.ts      # Variable interpolation
+│   │   │   │   │   └── ConditionEvaluator.ts  # Rule condition evaluation
+│   │   │   │   └── types/                     # TypeScript type definitions
+│   │   │   │       └── RenamingRuleTypes.ts
 │   │   │   └── index.ts        # Entry point
 │   │   ├── package.json
 │   │   └── tsconfig.json
@@ -173,6 +191,11 @@ meta-fuse/
 │   └── meta-fuse-ui/           # Monitoring dashboard (optional)
 │       ├── src/
 │       └── package.json
+│
+├── docs/                       # Architecture documentation
+│   ├── vfs-rebuild-architecture.md
+│   ├── streaming-architecture.md
+│   └── api-reference.md
 │
 ├── docker/
 │   ├── nginx.conf              # Reverse proxy config
@@ -191,21 +214,27 @@ meta-fuse/
 
 | Component | File | Purpose |
 |-----------|------|---------|
-| Entry Point | `src/index.ts` | Initializes KV manager, VFS, API server, pub/sub listener |
-| API Server | `src/api/APIServer.ts` | Fastify REST API for FUSE operations (readdir, getattr, read) |
+| Entry Point | `src/index.ts` | Initializes KV manager, VFS, API server, stream consumer |
+| API Server | `src/api/APIServer.ts` | Fastify REST API for FUSE operations and rules management |
 | KV Manager | `src/kv/KVManager.ts` | **FOLLOWER-only**: leader discovery, Redis connection, reconnection loop |
-| Leader Discovery | `src/kv/LeaderDiscovery.ts` | Reads `/meta-core/locks/kv-leader.lock` to find active Redis |
-| Redis Client | `src/kv/RedisClient.ts` | Wrapper around ioredis with pub/sub support |
+| Leader Client | `src/kv/LeaderClient.ts` | Reads `/meta-core/locks/kv-leader.info`, calls `/urls` API |
+| Redis Client | `src/kv/RedisClient.ts` | Wrapper around ioredis with Redis Streams support |
+| Service Discovery | `src/kv/ServiceDiscovery.ts` | Discovers all MetaMesh services via service files |
 | KV Interface | `src/kv/IKVClient.ts` | Read-only interface (get, scan, subscribe) |
 | Virtual FS | `src/vfs/VirtualFileSystem.ts` | In-memory VFS representation with caching |
+| Streaming State Builder | `src/vfs/StreamingStateBuilder.ts` | Processes `meta:events` stream, builds VFS state incrementally |
+| Rules Property Extractor | `src/vfs/RulesPropertyExtractor.ts` | Extracts VFS-relevant properties from renaming rules |
 | Folder Organizer | `src/vfs/MetaDataToFolderStruct.ts` | Converts flat metadata to organized folder structure |
 | Renaming Rules | `src/vfs/RenamingRule.ts` | Rules for virtual path organization |
+| Template Engine | `src/vfs/template/TemplateEngine.ts` | Variable interpolation for renaming templates |
+| Condition Evaluator | `src/vfs/template/ConditionEvaluator.ts` | Evaluates rule conditions against file metadata |
 
 **Note**: Unlike meta-sort, meta-fuse's KVManager is simplified:
 - **Never spawns Redis** (always FOLLOWER)
 - **Only reads metadata** (read-only interface)
-- **Discovers leader** via lock file at `/meta-core/locks/kv-leader.lock`
-- **No service discovery registration** (minimal footprint)
+- **Discovers leader** via lock file at `/meta-core/locks/kv-leader.info`
+- **Calls `/urls` API** to get Redis URL, WebDAV URL, and other endpoints
+- **Uses streaming mode** - processes `meta:events` stream for real-time updates
 
 ## Configuration
 
@@ -286,12 +315,28 @@ services:
 
 | Method | Endpoint | Description |
 |--------|----------|-------------|
-| GET | `/api/fuse/health` | Health check |
+| **Health & Status** |
+| GET | `/health` | Health check |
+| GET | `/api/health` | Health check (alias) |
+| GET | `/api/fuse/health` | Health check (alias) |
 | GET | `/api/fuse/stats` | Filesystem statistics |
+| **FUSE Operations** |
 | POST | `/api/fuse/readdir` | List directory contents |
 | POST | `/api/fuse/getattr` | Get file/directory attributes |
-| POST | `/api/fuse/read` | Read file content |
 | POST | `/api/fuse/exists` | Check path existence |
+| POST | `/api/fuse/read` | Read file content (returns source path or WebDAV URL) |
+| POST | `/api/fuse/metadata` | Get full metadata for a path |
+| GET | `/api/fuse/files` | List all virtual files |
+| GET | `/api/fuse/directories` | List all virtual directories |
+| POST | `/api/fuse/refresh` | Trigger VFS refresh |
+| **Renaming Rules** |
+| GET | `/api/fuse/rules` | Get current renaming rules configuration |
+| PUT | `/api/fuse/rules` | Update renaming rules configuration |
+| POST | `/api/fuse/rules/preview` | Preview how files would be renamed |
+| POST | `/api/fuse/rules/validate` | Validate a single rule |
+| GET | `/api/fuse/rules/variables` | Get list of available template variables |
+| **Service Discovery** |
+| GET | `/api/services` | List all discovered MetaMesh services |
 
 ### Example Responses
 
@@ -474,15 +519,19 @@ cargo build --release
 
 ### KV Data Structure
 
-meta-fuse reads metadata stored by meta-sort using the `meta-sort:` prefix:
+meta-fuse reads metadata stored by meta-sort using flat Redis keys:
 
 ```
-# File metadata stored by meta-sort (hash-based keys)
-meta-sort:file:{midhash256}:title         → "Inception"
-meta-sort:file:{midhash256}:year          → "2010"
-meta-sort:file:{midhash256}:filePath      → "media1/Movies/Inception (2010)/Inception.mkv"
-meta-sort:file:{midhash256}:size          → 4831838208
-meta-sort:file:{midhash256}:video/codec   → "h265"
+# File metadata stored by meta-sort (flat key format)
+file:{hashId}/title          → "Inception"
+file:{hashId}/year           → "2010"
+file:{hashId}/filePath       → "media1/Movies/Inception (2010)/Inception.mkv"
+file:{hashId}/size           → 4831838208
+file:{hashId}/video/codec    → "h265"
+file:{hashId}/titles/eng     → "Inception"
+
+# File index for enumeration
+file:__index__               → SET of all hashIds
 
 # VFS paths are computed dynamically from metadata
 # meta-fuse builds virtual paths like:
@@ -490,28 +539,45 @@ meta-sort:file:{midhash256}:video/codec   → "h265"
 #   → resolves to sourcePath: /files/media1/Movies/Inception (2010)/Inception.mkv
 ```
 
+**Key Format**: `file:{hashId}/{property}` where:
+- `hashId` is the midhash256 content identifier
+- `property` can be flat (e.g., `title`) or nested (e.g., `titles/eng`)
+
 **Note**: File paths in Redis are **relative to FILES_VOLUME** (`/files`). meta-fuse prepends the FILES_VOLUME path when resolving actual file locations.
 
-### Real-Time Updates via Pub/Sub
+### Real-Time Updates via Redis Streams
 
-meta-fuse subscribes to Redis pub/sub channel `meta-sort:file:batch` for real-time metadata updates from meta-sort:
+meta-fuse uses the `meta:events` Redis Stream for real-time metadata updates. The streaming architecture provides:
+- **Reliable delivery** - Messages persist until consumed
+- **Replay capability** - Can rebuild state from stream position 0
+- **Memory efficiency** - Only VFS-relevant properties are fetched
 
 ```typescript
-interface BatchUpdateMessage {
-    timestamp: number;
-    changes: Array<{
-        action: 'add' | 'update' | 'remove';
-        hashId: string;
-    }>;
+// Stream message format (meta:events)
+interface StreamMessage {
+    id: string;           // Stream entry ID (e.g., "1703808000000-0")
+    type: 'set' | 'del';  // Operation type
+    key: string;          // Redis key (e.g., "file:abc123/title")
+    ts: string;           // Timestamp
 }
 ```
 
-When meta-sort adds/updates/removes files, it publishes batch updates. meta-fuse processes these to:
-1. Invalidate affected caches
-2. Rebuild virtual paths for modified files
-3. Update directory listings without full refresh
+**Startup Sequence**:
+1. **Streaming Bootstrap**: Replay `meta:events` stream from position 0
+2. **Build State**: Process each event, fetch only VFS-relevant properties
+3. **Go Live**: Continue consuming new events from last processed position
 
-This ensures the virtual filesystem stays synchronized with metadata changes in near real-time.
+**Event Processing Pipeline**:
+1. Parse key to extract `hashId` and `property`
+2. Check if property is VFS-relevant (based on renaming rules)
+3. If relevant, fetch property value from Redis
+4. Update internal state and notify VFS
+5. When file has `filePath`, it appears in VFS
+
+This streaming architecture enables:
+- Sub-second startup (no HGETALL/SCAN)
+- Memory-efficient state (~500 bytes/file)
+- Real-time VFS updates as files are processed
 
 ---
 
@@ -537,10 +603,13 @@ journalctl -u meta-fuse-driver -f
 
 ```bash
 # Check lock file exists
-cat /data/apps/meta-core/db/redis.lock
+cat /meta-core/locks/kv-leader.info
+
+# Check /urls API
+curl http://localhost:8083/api/urls
 
 # Verify redis is running (on leader)
-redis-cli ping
+docker exec meta-core-dev redis-cli ping
 
 # Check meta-fuse logs
 docker logs meta-fuse | grep "KV"
@@ -562,14 +631,20 @@ docker logs meta-fuse | grep "wsgidav"
 ### Files Not Appearing
 
 ```bash
-# Check KV has data
-redis-cli keys "meta-fuse:vfs:*"
+# Check Redis has file data (flat key format)
+docker exec meta-core-dev redis-cli keys "file:*" | head -20
+
+# Check file index
+docker exec meta-core-dev redis-cli scard "file:__index__"
 
 # Verify source files exist
-ls -la /data/watch/
+ls -la /files/watch/
 
 # Check API stats
 curl http://localhost:3000/api/fuse/stats
+
+# Check streaming state builder stats
+docker logs meta-fuse-dev | grep "State builder"
 ```
 
 ## Technology Stack
@@ -597,14 +672,25 @@ Meta-Fuse is designed to work seamlessly with other MetaMesh services:
 Ensure meta-sort is running and has processed files:
 
 ```bash
-# On meta-sort host
-curl http://localhost:3000/api/processing/status
+# Check meta-sort processing status
+curl http://localhost:8180/api/processing/status
 
-# Verify KV has metadata
-redis-cli keys "meta-sort:file:*"
+# Verify Redis has metadata (via meta-core)
+docker exec meta-core-dev redis-cli scard "file:__index__"
+
+# Check meta:events stream has events
+docker exec meta-core-dev redis-cli xlen "meta:events"
 ```
 
-Meta-fuse will automatically discover the KV database through the shared lock file.
+Meta-fuse will automatically discover the KV database through the shared lock file at `/meta-core/locks/kv-leader.info`.
+
+## Documentation
+
+For detailed architecture documentation, see the `docs/` directory:
+
+- [VFS Rebuild Architecture](docs/vfs-rebuild-architecture.md) - How VFS state is built from Redis Streams
+- [Streaming Architecture](docs/streaming-architecture.md) - Event processing pipeline details
+- [API Reference](docs/api-reference.md) - Complete REST API documentation
 
 ## License
 

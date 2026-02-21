@@ -15,7 +15,7 @@ import { TemplateEngine } from './template/TemplateEngine.js';
 import { ConditionEvaluator } from './template/ConditionEvaluator.js';
 import { ConfigStorage } from '../config/ConfigStorage.js';
 import type { RenamingConfig, RenamingRule, PreviewItem, PreviewResponse } from './types/RenamingRuleTypes.js';
-import type { VFSUpdateCallback } from './StreamingStateBuilder.js';
+import type { VFSUpdateCallback, StreamingStateBuilder } from './StreamingStateBuilder.js';
 
 const logger = new Logger({ name: 'VirtualFileSystem' });
 
@@ -72,6 +72,7 @@ export class VirtualFileSystem implements VFSUpdateCallback {
     private config: Required<VFSConfig>;
     private lastRefresh: Date | null = null;
     private useStreamingMode: boolean = false;  // Flag to indicate streaming mode
+    private stateBuilder: StreamingStateBuilder | null = null;  // For stream replay during refresh
 
     private cachedStats = {
         fileCount: 0,
@@ -126,6 +127,15 @@ export class VirtualFileSystem implements VFSUpdateCallback {
     enableStreamingMode(): void {
         this.useStreamingMode = true;
         logger.info('VFS streaming mode enabled');
+    }
+
+    /**
+     * Set the streaming state builder for refresh operations
+     * This enables refresh() to replay the event stream instead of using broken HGETALL
+     */
+    setStreamingStateBuilder(builder: StreamingStateBuilder): void {
+        this.stateBuilder = builder;
+        logger.debug('StreamingStateBuilder set for VFS refresh');
     }
 
     /**
@@ -281,44 +291,142 @@ export class VirtualFileSystem implements VFSUpdateCallback {
     }
 
     /**
-     * Refresh the VFS from Redis
-     * Called once on startup for initial bootstrap.
-     * Subsequent updates come via Redis Streams (onFileUpdate).
-     * Uses template-based rules if configured, otherwise falls back to MetaDataToFolderStruct
+     * Refresh the VFS from Redis by replaying the event stream
+     *
+     * This method replays the meta:events stream from position 0, applying updates
+     * incrementally without wiping the existing VFS state. Files not seen during
+     * the replay are considered deleted and removed.
+     *
+     * Design principles:
+     * - Do NOT wipe the internal model (no initRoot() call)
+     * - Track which files are seen during replay
+     * - Remove only files that are no longer in the stream (deleted)
+     * - Single code path - reuses StreamingStateBuilder event processing
      */
     async refresh(): Promise<void> {
-        logger.debug('Loading VFS from Redis (bootstrap)');
+        logger.info('Refreshing VFS from event stream...');
+        const startTime = Date.now();
+
+        // Load rules configuration
+        this.loadRulesConfig();
+
+        // Check if we have a streaming state builder configured
+        if (!this.stateBuilder) {
+            logger.warn('No StreamingStateBuilder set - cannot refresh from stream');
+            logger.warn('VFS refresh skipped. Set streaming state builder via setStreamingStateBuilder()');
+            return;
+        }
 
         try {
-            // Load rules configuration
-            this.loadRulesConfig();
+            // Track which hashIds we see during this refresh
+            const seenHashIds = new Set<string>();
 
-            // Get all files from Redis (keyed by sourcePath)
-            const files = await this.redisClient.getAllFiles();
+            // Create a tracking callback that records seen hashIds
+            const originalCallback = this.stateBuilder.getVFSCallback();
+            const trackingVFS: VFSUpdateCallback = {
+                onPropertyChange: (hashId, property, value) => {
+                    this.onPropertyChange(hashId, property, value);
+                },
+                onPropertyDelete: (hashId, property) => {
+                    this.onPropertyDelete(hashId, property);
+                },
+                onFileDelete: (hashId) => {
+                    this.onFileDelete(hashId);
+                },
+                onFileComplete: (hashId, metadata) => {
+                    seenHashIds.add(hashId);
+                    this.onFileComplete(hashId, metadata);
+                },
+            };
 
-            if (files.size === 0) {
-                logger.info('No files found in Redis');
-                this.initRoot();
-                return;
-            }
+            // Temporarily set tracking callback
+            this.stateBuilder.setVFSCallback(trackingVFS);
 
-            // Rebuild VFS with computed paths
-            this.initRoot();
+            // Clear state builder's internal state (but NOT VFS nodes)
+            this.stateBuilder.clear();
 
-            for (const [sourcePath, metadata] of files) {
-                // Compute virtual path using rules or fallback
-                const virtualPath = this.computeVirtualPath(metadata, sourcePath);
-                if (virtualPath) {
-                    await this.addFile(virtualPath, metadata);
-                    this.sourcePathToVirtualPath.set(sourcePath, virtualPath);
+            // Replay meta:events stream from position 0
+            const lastId = await this.redisClient.replayStream(
+                'meta:events',
+                '0',
+                async (message) => {
+                    await this.stateBuilder!.processEvent(message);
+                },
+                100 // Batch size
+            );
+
+            // Fallback: If no files found from stream replay, scan flat keys directly
+            // This handles the case where meta:events stream isn't being populated
+            // but data exists in flat key format
+            if (seenHashIds.size === 0) {
+                const indexCount = await this.redisClient.getIndexCount();
+                if (indexCount > 0) {
+                    logger.info(`Stream replay found no files but index has ${indexCount} - scanning flat keys...`);
+
+                    // Get VFS-relevant properties from state builder
+                    const vfsRelevantProps = this.stateBuilder.getVfsRelevantProperties();
+
+                    // Scan flat keys
+                    const flatKeyFiles = await this.redisClient.scanFlatKeysForFiles(vfsRelevantProps);
+
+                    // Process each file through onFileComplete
+                    for (const [hashId, props] of flatKeyFiles) {
+                        seenHashIds.add(hashId);
+                        this.onFileComplete(hashId, props);
+                    }
+
+                    logger.info(`Flat key scan populated ${seenHashIds.size} files`);
                 }
             }
 
+            // Restore original callback
+            this.stateBuilder.setVFSCallback(originalCallback || this);
+
+            // Remove files not seen during replay (these were deleted)
+            const toRemove: string[] = [];
+            for (const [hashId, virtualPath] of this.hashIdToVirtualPath) {
+                if (!seenHashIds.has(hashId)) {
+                    logger.debug(`Removing deleted file: ${hashId} -> ${virtualPath}`);
+                    toRemove.push(hashId);
+                }
+            }
+
+            for (const hashId of toRemove) {
+                const virtualPath = this.hashIdToVirtualPath.get(hashId);
+                if (virtualPath) {
+                    this.removeFile(virtualPath);
+                }
+                this.hashIdToVirtualPath.delete(hashId);
+            }
+
             this.lastRefresh = new Date();
-            logger.info(`VFS refreshed: ${this.cachedStats.fileCount} files, ${this.cachedStats.directoryCount} directories`);
+            this.updateStats();
+            const elapsed = Date.now() - startTime;
+            logger.info(`VFS refresh complete: ${this.cachedStats.fileCount} files, ${this.cachedStats.directoryCount} directories in ${elapsed}ms`);
+            logger.info(`Replay ended at stream position: ${lastId}, removed ${toRemove.length} deleted files`);
         } catch (error) {
             logger.error('Failed to refresh VFS:', error);
         }
+    }
+
+    /**
+     * Update cached stats from current nodes
+     */
+    private updateStats(): void {
+        let fileCount = 0;
+        let directoryCount = 0;
+        let totalSize = 0;
+
+        for (const node of this.nodes.values()) {
+            if (node.type === 'file') {
+                fileCount++;
+                totalSize += node.size ?? 0;
+            } else {
+                directoryCount++;
+            }
+        }
+
+        this.cachedStats = { fileCount, directoryCount, totalSize };
     }
 
     /**

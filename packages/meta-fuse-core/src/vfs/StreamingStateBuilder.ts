@@ -102,6 +102,21 @@ export class StreamingStateBuilder {
     }
 
     /**
+     * Get the set of VFS-relevant properties
+     * Used by VFS refresh for flat key scanning fallback
+     */
+    getVfsRelevantProperties(): Set<string> {
+        return this.vfsRelevantProps;
+    }
+
+    /**
+     * Get the current VFS callback
+     */
+    getVFSCallback(): VFSUpdateCallback | undefined {
+        return this.vfsCallback;
+    }
+
+    /**
      * Process a stream message event
      * This is the main entry point for event processing
      */
