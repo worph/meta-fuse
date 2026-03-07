@@ -85,10 +85,7 @@ export class APIServer {
     this.app.post('/api/fuse/rules/validate', this.handleValidateRule.bind(this));
     this.app.get('/api/fuse/rules/variables', this.handleGetVariables.bind(this));
 
-    // Service discovery (for inter-service navigation)
-    if (this.kvManager) {
-      this.app.get('/api/services', this.handleServices.bind(this));
-    }
+    // Note: /api/services is handled by nginx proxy to meta-core (centralized service discovery)
   }
 
   /**
@@ -162,7 +159,7 @@ export class APIServer {
       return;
     }
 
-    const attrs = this.vfs.getattr(path);
+    const attrs = await this.vfs.getattr(path);
 
     if (attrs === null) {
       reply.status(404).send({ error: 'Path not found' });
@@ -198,7 +195,7 @@ export class APIServer {
       return;
     }
 
-    const result = this.vfs.read(path);
+    const result = await this.vfs.read(path);
 
     if (result === null) {
       reply.status(404).send({ error: 'File not found' });
@@ -259,64 +256,6 @@ export class APIServer {
   private async handleRefresh(_req: FastifyRequest, reply: FastifyReply): Promise<void> {
     await this.vfs.refresh();
     reply.send({ status: 'ok' });
-  }
-
-  private async handleServices(_req: FastifyRequest, reply: FastifyReply): Promise<void> {
-    interface ServiceResponse {
-      name: string;
-      url: string;
-      api: string;
-      status: string;
-      role?: string;
-    }
-
-    const services: ServiceResponse[] = [];
-    let leaderInfo: {
-      hostname: string;
-      baseUrl: string;
-      apiUrl: string;
-      redisUrl: string;
-      webdavUrl: string;
-    } | null = null;
-
-    try {
-      const serviceDiscovery = this.kvManager?.getServiceDiscovery();
-      if (serviceDiscovery) {
-        const allServices = await serviceDiscovery.discoverAllServices();
-
-        for (const svc of allServices) {
-          services.push({
-            name: svc.name || 'Unknown',
-            url: svc.baseUrl || '',
-            api: svc.baseUrl || '',
-            status: svc.status || 'unknown',
-            role: svc.role,
-          });
-        }
-      }
-    } catch (error) {
-      logger.error('Error discovering services:', error);
-    }
-
-    // Get leader info
-    if (this.kvManager) {
-      const info = this.kvManager.getLeaderInfo();
-      if (info) {
-        leaderInfo = {
-          hostname: info.hostname,
-          baseUrl: info.baseUrl,
-          apiUrl: info.apiUrl,
-          redisUrl: info.redisUrl,
-          webdavUrl: info.webdavUrl,
-        };
-      }
-    }
-
-    reply.send({
-      services,
-      current: 'meta-fuse',
-      leader: leaderInfo,
-    });
   }
 
   // ============================================

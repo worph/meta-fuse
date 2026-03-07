@@ -668,6 +668,38 @@ export class VirtualFileSystem implements VFSUpdateCallback {
     }
 
     /**
+     * Ensure file has a valid size, fetching via WebDAV if needed
+     * This is called lazily when getattr() or read() is invoked
+     */
+    private async ensureFileSize(node: VFSNode): Promise<void> {
+        // Only fetch if size is 0/missing and we have WebDAV configured
+        if (node.size && node.size > 0) {
+            return;
+        }
+
+        if (!node.sourcePath || !this.config.webdavBaseUrl) {
+            return;
+        }
+
+        logger.debug(`Fetching file size via WebDAV for: ${node.sourcePath}`);
+        const stats = await this.statViaWebDAV(node.sourcePath);
+
+        if (stats && stats.size > 0) {
+            // Update the node with the fetched size
+            const oldSize = node.size ?? 0;
+            node.size = stats.size;
+            if (stats.mtime) {
+                node.mtime = stats.mtime;
+            }
+            // Update total size stats
+            this.cachedStats.totalSize = this.cachedStats.totalSize - oldSize + stats.size;
+            logger.debug(`WebDAV size fetch successful: ${node.sourcePath} = ${stats.size} bytes`);
+        } else {
+            logger.warn(`WebDAV size fetch failed for: ${node.sourcePath}`);
+        }
+    }
+
+    /**
      * Get file stats via WebDAV HEAD request
      */
     private async statViaWebDAV(sourcePath: string): Promise<{ size: number; mtime?: Date } | null> {
@@ -841,8 +873,9 @@ export class VirtualFileSystem implements VFSUpdateCallback {
 
     /**
      * Get file attributes
+     * Lazily fetches file size via WebDAV if missing
      */
-    getattr(filepath: string): FileAttributes | null {
+    async getattr(filepath: string): Promise<FileAttributes | null> {
         filepath = this.normalizePath(filepath);
         const node = this.nodes.get(filepath);
 
@@ -862,6 +895,9 @@ export class VirtualFileSystem implements VFSUpdateCallback {
                 gid: this.config.gid,
             };
         } else {
+            // Lazily fetch size via WebDAV if missing
+            await this.ensureFileSize(node);
+
             return {
                 size: node.size!,
                 mode: 0o100000 | this.config.fileMode,
@@ -885,14 +921,18 @@ export class VirtualFileSystem implements VFSUpdateCallback {
 
     /**
      * Read file (returns source path and/or WebDAV URL for actual reading)
+     * Lazily fetches file size via WebDAV if missing
      */
-    read(filepath: string): ReadResult | null {
+    async read(filepath: string): Promise<ReadResult | null> {
         filepath = this.normalizePath(filepath);
         const node = this.nodes.get(filepath);
 
         if (!node || node.type !== 'file') {
             return null;
         }
+
+        // Lazily fetch size via WebDAV if missing
+        await this.ensureFileSize(node);
 
         // Compute WebDAV URL if configured
         let webdavUrl: string | null = null;

@@ -30,6 +30,7 @@ const CORE_PROPERTIES = new Set([
     'filePath',      // Source file location (must exist for file to appear in VFS)
     'size',          // File size attribute
     'fileSize',      // Alternative name for size
+    'sizeByte',      // Alternative name for size (used by meta-sort plugins)
     'mtime',         // Modification time
     'ctime',         // Creation time
     'fileName',      // Filename for fallback naming
