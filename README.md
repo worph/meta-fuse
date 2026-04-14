@@ -606,7 +606,7 @@ journalctl -u meta-fuse-driver -f
 cat /meta-core/locks/kv-leader.info
 
 # Check /urls API
-curl http://localhost:8083/api/urls
+curl -k https://dev.localhost:8083/api/urls
 
 # Verify redis is running (on leader)
 docker exec meta-core-dev redis-cli ping
@@ -673,7 +673,7 @@ Ensure meta-sort is running and has processed files:
 
 ```bash
 # Check meta-sort processing status
-curl http://localhost:8180/api/processing/status
+curl -k https://dev.localhost:8180/api/processing/status
 
 # Verify Redis has metadata (via meta-core)
 docker exec meta-core-dev redis-cli scard "file:__index__"
