@@ -85,7 +85,40 @@ export class APIServer {
     this.app.post('/api/fuse/rules/validate', this.handleValidateRule.bind(this));
     this.app.get('/api/fuse/rules/variables', this.handleGetVariables.bind(this));
 
-    // Note: /api/services is handled by nginx proxy to meta-core (centralized service discovery)
+    // Service discovery — proxies to meta-core's /api/services, resolving the
+    // current leader's URL via LeaderClient (no hardcoded hostname).
+    this.app.get('/api/services', this.handleServices.bind(this));
+  }
+
+  /**
+   * Proxy handler that forwards /api/services to meta-core's canonical
+   * registry endpoint using LeaderClient for discovery.
+   */
+  private async handleServices(_req: FastifyRequest, reply: FastifyReply): Promise<void> {
+    try {
+      const leaderClient = this.kvManager?.getLeaderClient();
+      if (!leaderClient) {
+        reply.status(503).send({ error: 'KVManager not initialized' });
+        return;
+      }
+      const apiUrl = await leaderClient.getApiUrl();
+      if (!apiUrl) {
+        reply.status(503).send({ error: 'Leader not available yet' });
+        return;
+      }
+      const response = await fetch(`${apiUrl}/api/services`, {
+        signal: AbortSignal.timeout(5000),
+      });
+      if (!response.ok) {
+        reply.status(response.status).send({
+          error: `Upstream ${apiUrl} returned ${response.status}`,
+        });
+        return;
+      }
+      reply.send(await response.json());
+    } catch (err: any) {
+      reply.status(502).send({ error: err?.message ?? String(err) });
+    }
   }
 
   /**
