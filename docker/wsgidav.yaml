@@ -3,17 +3,14 @@
 host: 0.0.0.0
 port: 8080
 
-# Simple user authentication
-simple_dc:
-  user_mapping:
-    "/":
-      metamesh:
-        password: metamesh
-        roles: ["editor"]
-    "/webdav":
-      metamesh:
-        password: metamesh
-        roles: ["editor"]
+# Authentication is delegated to a custom DomainController that validates the
+# basic-auth password against meta-fuse's per-device token store. Any
+# non-empty username is accepted; the password IS the token (`mfwd_*`).
+http_authenticator:
+  domain_controller: webdav_token_controller.WebdavTokenController
+  accept_basic: true
+  accept_digest: false
+  default_to_digest: false
 
 # Mount the virtual filesystem
 provider_mapping:
@@ -30,11 +27,6 @@ logging:
 server: cheroot
 server_args:
   numthreads: 10
-
-# Authentication settings
-accept_basic: true
-accept_digest: false
-default_to_digest: false
 
 # HTTP configuration
 add_header_MS_Author_Via: false

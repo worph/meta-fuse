@@ -121,6 +121,7 @@ RUN chmod +x /usr/local/bin/meta-core
 COPY docker/nginx.conf /etc/nginx/nginx.conf
 COPY docker/supervisord.conf /etc/supervisor/conf.d/supervisord.conf
 COPY docker/wsgidav.yaml /app/docker/
+COPY docker/webdav_token_controller.py /app/docker/
 COPY docker/welcome.html /app/welcome/
 COPY docker/start-fuse-driver.sh /app/docker/
 RUN chmod 644 /app/welcome/welcome.html && \

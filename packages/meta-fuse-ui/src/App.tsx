@@ -1,6 +1,7 @@
 import { useState, useEffect, useCallback } from 'react';
 import { RulesEditor } from './components/RulesEditor';
 import ServiceNav from './components/ServiceNav';
+import { WebdavTokens } from './components/WebdavTokens';
 
 interface Stats {
   fileCount: number;
@@ -39,6 +40,7 @@ function App() {
   const [refreshing, setRefreshing] = useState(false);
   const [showRules, setShowRules] = useState(false);
   const [showSetup, setShowSetup] = useState(false);
+  const [showTokens, setShowTokens] = useState(false);
 
   const fetchData = useCallback(async () => {
     try {
@@ -222,6 +224,17 @@ function App() {
           {showRules && (
             <RulesEditor onSave={fetchData} />
           )}
+        </div>
+
+        <div className="subsection">
+          <div
+            className="section-header-collapsible"
+            onClick={() => setShowTokens(!showTokens)}
+          >
+            <h3 className="subsection-title">WebDAV Access Tokens</h3>
+            <span className="collapse-icon">{showTokens ? '-' : '+'}</span>
+          </div>
+          {showTokens && <WebdavTokens />}
         </div>
       </div>
 

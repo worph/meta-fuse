@@ -13,6 +13,7 @@ import type { RenamingConfig, RenamingRule, PreviewResponse } from '../vfs/types
 import { TEMPLATE_VARIABLES } from '../vfs/types/RenamingRuleTypes.js';
 import { TemplateEngine } from '../vfs/template/TemplateEngine.js';
 import { ConditionEvaluator } from '../vfs/template/ConditionEvaluator.js';
+import { TokenStore } from '../webdav/TokenStore.js';
 
 const logger = new Logger({ name: 'APIServer' });
 
@@ -30,6 +31,7 @@ export class APIServer {
   private vfs: VirtualFileSystem;
   private kvManager: KVManager | null = null;
   private config: Required<APIServerConfig>;
+  private tokenStore: TokenStore;
 
   constructor(vfs: VirtualFileSystem, config: APIServerConfig = {}, kvManager?: KVManager) {
     this.vfs = vfs;
@@ -38,6 +40,10 @@ export class APIServer {
       port: config.port ?? parseInt(process.env.API_PORT ?? '3000', 10),
       host: config.host ?? process.env.API_HOST ?? '0.0.0.0',
     };
+    // CONFIG_DIR is the same dir ConfigStorage uses for renaming rules.
+    this.tokenStore = new TokenStore({
+      configDir: process.env.CONFIG_DIR ?? '/meta-fuse/config',
+    });
 
     this.app = Fastify({
       logger: false,
@@ -88,6 +94,43 @@ export class APIServer {
     // Service discovery — proxies to meta-core's /api/services, resolving the
     // current leader's URL via LeaderClient (no hardcoded hostname).
     this.app.get('/api/services', this.handleServices.bind(this));
+
+    // WebDAV access tokens (per-device basic-auth passwords for /webdav).
+    this.app.get('/api/webdav-tokens', this.handleListTokens.bind(this));
+    this.app.post('/api/webdav-tokens', this.handleCreateToken.bind(this));
+    this.app.delete('/api/webdav-tokens/:id', this.handleRevokeToken.bind(this));
+  }
+
+  private async handleListTokens(_req: FastifyRequest, reply: FastifyReply): Promise<void> {
+    reply.send({ tokens: this.tokenStore.list() });
+  }
+
+  private async handleCreateToken(
+    req: FastifyRequest<{ Body: { label?: string } }>,
+    reply: FastifyReply
+  ): Promise<void> {
+    const label = (req.body?.label ?? '').toString();
+    if (label.length > 200) {
+      reply.status(400).send({ error: 'label too long (max 200 chars)' });
+      return;
+    }
+    const { plaintext, view } = this.tokenStore.create(label);
+    // The plaintext is included exactly once in this response — the dashboard
+    // surfaces it to the user and then discards it. Subsequent GETs do not
+    // include it.
+    reply.status(201).send({ ...view, token: plaintext });
+  }
+
+  private async handleRevokeToken(
+    req: FastifyRequest<{ Params: { id: string } }>,
+    reply: FastifyReply
+  ): Promise<void> {
+    const ok = this.tokenStore.revoke(req.params.id);
+    if (!ok) {
+      reply.status(404).send({ error: 'token not found' });
+      return;
+    }
+    reply.status(204).send();
   }
 
   /**
