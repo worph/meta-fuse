@@ -113,7 +113,7 @@ export class KVManager {
         try {
             const leaderInfo = await this.leaderClient.waitForLeader(30000);
             logger.info(`Connecting to Redis at ${leaderInfo.redisUrl}...`);
-            await this.connectToRedis(leaderInfo.redisUrl);
+            await this.connectToRedis(leaderInfo.redisUrl, leaderInfo.apiUrl);
         } catch (error: any) {
             logger.error(`Failed to connect to leader: ${error.message}`);
             throw error;
@@ -141,7 +141,7 @@ export class KVManager {
         try {
             const leaderInfo = await this.leaderClient.waitForLeader(30000);
             logger.info(`Reconnecting to Redis at ${leaderInfo.redisUrl}...`);
-            await this.connectToRedis(leaderInfo.redisUrl);
+            await this.connectToRedis(leaderInfo.redisUrl, leaderInfo.apiUrl);
         } catch (error: any) {
             logger.error(`Failed to reconnect: ${error.message}`);
         }
@@ -178,20 +178,28 @@ export class KVManager {
     /**
      * Connect to Redis
      */
-    private async connectToRedis(url: string): Promise<void> {
+    private async connectToRedis(url: string, apiUrl?: string): Promise<void> {
         try {
             // Disconnect existing client if any
             await this.disconnectRedis();
 
-            // Create new client
+            // Create new client. When apiUrl is supplied, reads route
+            // through meta-core HTTP (api-mediated-access PR C).
+            // When url is also empty, the client is HTTP-only and never
+            // opens a Redis socket (post-PR D state).
             this.redisClient = new RedisClient({
-                url,
+                url,  // may be '' in PR D world
                 prefix: this.config.redisPrefix,
-                filesVolume: this.config.filesPath
+                filesVolume: this.config.filesPath,
+                metaCoreApiUrl: apiUrl,
             });
 
             await this.redisClient.connect();
-            logger.info('Connected to Redis');
+            if (url) {
+                logger.info('Connected to Redis');
+            } else {
+                logger.info('Storage client ready (HTTP-only mode, no Redis)');
+            }
 
             // Notify ready
             this.notifyReady();

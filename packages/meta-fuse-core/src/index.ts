@@ -11,6 +11,7 @@ import 'dotenv/config';
 import { Logger } from 'tslog';
 import { KVManager } from './kv/KVManager.js';
 import { RedisClient, StreamMessage } from './kv/RedisClient.js';
+import { SSEEventClient, type SSEEvent } from './kv/SSEEventClient.js';
 import { VirtualFileSystem } from './vfs/VirtualFileSystem.js';
 import { StreamingStateBuilder } from './vfs/StreamingStateBuilder.js';
 import { APIServer } from './api/APIServer.js';
@@ -76,13 +77,16 @@ async function main(): Promise<void> {
     let vfs: VirtualFileSystem | null = null;
     let stateBuilder: StreamingStateBuilder | null = null;
     let apiServer: APIServer | null = null;
+    let sseClient: SSEEventClient | null = null;
 
     // Graceful shutdown
     const shutdown = async (signal: string): Promise<void> => {
         logger.info(`Received ${signal}, shutting down...`);
 
         try {
-            // Stop stream consumer first
+            // Stop SSE consumer first
+            if (sseClient) await sseClient.stop();
+            // Stop legacy stream consumer if it ever ran
             if (redisClient) {
                 redisClient.stopStreamConsumer();
             }
@@ -155,35 +159,52 @@ async function main(): Promise<void> {
             // This enables vfs.refresh() to replay the event stream
             vfs.setStreamingStateBuilder(stateBuilder);
 
-            // Bootstrap: Replay meta:events stream from position 0
-            // This rebuilds state from all historical events
-            logger.info(`Replaying ${EVENTS_STREAM} stream from position 0 (streaming bootstrap)...`);
-            const bootstrapStart = Date.now();
-
-            const lastId = await redisClient.replayStream(
-                EVENTS_STREAM,
-                '0',
-                async (message: StreamMessage) => {
+            // Bootstrap + live stream via SSE on /api/events/meta.
+            //
+            // We persist the cursor; on a clean restart we resume from where
+            // we left off. On a `gap` event (cursor trimmed out of retention)
+            // we fall back to replaying from the oldest available entry,
+            // which is good enough to rebuild VFS state because every property
+            // change has been republished into the stream by meta-core.
+            const apiUrl = leaderInfo?.apiUrl;
+            if (!apiUrl) {
+                throw new Error('meta-core apiUrl not available from leader info; cannot start SSE consumer');
+            }
+            logger.info(`Starting SSE consumer for /api/events/meta (apiUrl=${apiUrl})...`);
+            sseClient = new SSEEventClient({
+                url: `${apiUrl.replace(/\/+$/, '')}/api/events/meta`,
+                // Deliberately NOT persisting the cursor. meta-fuse holds
+                // VFS state purely in memory, so each restart needs to
+                // rebuild from a full event replay. Setting cursorPath to
+                // null + initialCursor to "0-0" forces the gap-handling
+                // path which resumes from the oldest available stream
+                // entry — i.e. effectively a full bootstrap.
+                cursorPath: null,
+                logTag: '[meta-fuse SSE]',
+                initialCursor: '0-0',
+                onEvent: async (e: SSEEvent) => {
+                    // Translate SSE event back into the StreamMessage shape
+                    // StreamingStateBuilder expects.
+                    const message: StreamMessage = {
+                        id: e.id,
+                        type: e.event as any,
+                        key: e.data?.key,
+                        path: e.data?.path,
+                        size: e.data?.size,
+                        midhash256: e.data?.midhash256,
+                        oldPath: e.data?.oldPath,
+                        watcherId: e.data?.watcherId,
+                        timestamp: e.data?.timestamp ?? e.data?.ts,
+                    } as StreamMessage;
                     await handleStreamingEvent(message, stateBuilder!);
                 },
-                100 // Batch size
-            );
-
-            const bootstrapTime = Date.now() - bootstrapStart;
-            const stats = vfs.getStats();
-            logger.info(`Streaming bootstrap complete: ${stats.fileCount} files in ${bootstrapTime}ms`);
-
-            // Start live stream consumer from where replay left off
-            logger.info(`Starting live stream consumer from ${lastId}...`);
-            redisClient.startSimpleStreamConsumer(
-                EVENTS_STREAM,
-                lastId,
-                async (message: StreamMessage) => {
-                    await handleStreamingEvent(message, stateBuilder!);
+                onGap: (payload) => {
+                    logger.warn(`SSE cursor ${payload.requested} trimmed; resuming from ${payload.resumeFrom}`);
                 },
-                5000 // 5 second block timeout
-            ).catch(error => {
-                logger.error('Stream consumer error:', error);
+            });
+            // Fire-and-forget; start() returns when stop() fires.
+            sseClient.start().catch((error) => {
+                logger.error('SSE consumer terminated:', error);
             });
 
             // Initialize API server (with kvManager for service discovery)

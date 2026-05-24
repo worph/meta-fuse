@@ -12,6 +12,7 @@ import { Redis } from 'ioredis';
 import { Logger } from 'tslog';
 import * as os from 'os';
 import type { IKVClient, KeyValuePair } from './IKVClient.js';
+import { MetaCoreApiClient } from './MetaCoreApiClient.js';
 
 const logger = new Logger({ name: 'RedisClient' });
 
@@ -104,15 +105,27 @@ export interface RedisClientConfig {
     prefix?: string;
     filesVolume?: string;
     reconnectInterval?: number;
+
+    /**
+     * meta-core HTTP API base URL. When set, read methods (getProperty,
+     * getProperties, getMetadataFlat, getAllHashIds, health) route through
+     * the /meta/{hash} HTTP family instead of touching Redis directly.
+     *
+     * This is the meta-fuse half of the api-mediated-access lockdown (see
+     * meta-core docs/api-mediated-access.md). Reads stay on Redis when
+     * left unset so tests / one-off scripts still work.
+     */
+    metaCoreApiUrl?: string;
 }
 
 export class RedisClient implements Partial<IKVClient> {
     private client: Redis | null = null;
     private subscriber: Redis | null = null;
-    private config: Required<RedisClientConfig>;
+    private config: Required<Omit<RedisClientConfig, 'metaCoreApiUrl'>> & Pick<RedisClientConfig, 'metaCoreApiUrl'>;
     private isConnected = false;
     private reconnectTimer: NodeJS.Timeout | null = null;
     private subscriptions: Map<string, (message: string) => void> = new Map();
+    private apiClient: MetaCoreApiClient | null = null;
 
     // Stream consumer state
     private streamConsumerRunning = false;
@@ -125,17 +138,30 @@ export class RedisClient implements Partial<IKVClient> {
             prefix: config.prefix ?? process.env.REDIS_PREFIX ?? '',
             filesVolume: config.filesVolume ?? process.env.FILES_VOLUME ?? '/files',
             reconnectInterval: config.reconnectInterval ?? 5000,
+            metaCoreApiUrl: config.metaCoreApiUrl,
         };
+
+        if (this.config.metaCoreApiUrl) {
+            this.apiClient = new MetaCoreApiClient({ apiUrl: this.config.metaCoreApiUrl });
+            logger.info(`Reads routed through meta-core API at ${this.config.metaCoreApiUrl}`);
+        }
 
         // Unique consumer name for this instance
         this.consumerName = `${os.hostname()}-${process.pid}`;
     }
 
     /**
-     * Connect to Redis
+     * Connect to Redis. In HTTP-only mode (no URL + apiClient set) this is
+     * a no-op — reads route through MetaCoreApiClient and stream
+     * consumption is owned by SSEEventClient at the index.ts layer.
      */
     async connect(): Promise<void> {
         if (this.client && this.isConnected) {
+            return;
+        }
+
+        if (this.apiClient && !this.config.url) {
+            logger.info('HTTP-only mode — no direct Redis connection');
             return;
         }
 
@@ -236,9 +262,18 @@ export class RedisClient implements Partial<IKVClient> {
     }
 
     /**
-     * Check if connected
+     * Check if the metadata backend is reachable.
+     *
+     * In HTTP-only mode (api-mediated-access PR D) there's no Redis socket;
+     * reachability is signalled by having an apiClient configured. The
+     * health badge is keyed off this; reporting `false` there would make
+     * the UI permanently show "Disconnected" even though the service is
+     * working fine over HTTP.
      */
     get connected(): boolean {
+        if (this.apiClient && !this.config.url) {
+            return true;
+        }
         return this.isConnected;
     }
 
@@ -255,6 +290,15 @@ export class RedisClient implements Partial<IKVClient> {
      * @returns The property value or null if not found
      */
     async getProperty(hashId: string, property: string): Promise<string | null> {
+        if (this.apiClient) {
+            try {
+                return await this.apiClient.getProperty(hashId, property);
+            } catch (error: any) {
+                logger.error(`HTTP getProperty failed for ${hashId}/${property}:`, error.message);
+                return null;
+            }
+        }
+
         if (!this.client || !this.isConnected) {
             return null;
         }
