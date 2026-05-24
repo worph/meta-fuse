@@ -88,7 +88,24 @@ export class LeaderClient {
                 return null;
             }
 
-            this.cachedUrls = await response.json() as URLsResponse;
+            const parsed = await response.json() as URLsResponse;
+            // api-mediated-access PR D: redisUrl is no longer published by
+            // meta-core. If it shows up, an older build snuck back in —
+            // fail loudly so the rollback can't go unnoticed. Set
+            // ALLOW_LEGACY_REDIS_URL=1 to downgrade to a warning during a
+            // deliberate temporary rollback.
+            if (parsed.redisUrl) {
+                const msg =
+                    'meta-core still publishes redisUrl; direct Redis access ' +
+                    'was retired by the api-mediated-access lockdown. Verify ' +
+                    'meta-core version.';
+                if (process.env.ALLOW_LEGACY_REDIS_URL === '1') {
+                    logger.warn('WARNING: ' + msg);
+                } else {
+                    throw new Error(msg);
+                }
+            }
+            this.cachedUrls = parsed;
             this.urlsCacheTime = now;
             return this.cachedUrls;
         } catch (error: any) {
