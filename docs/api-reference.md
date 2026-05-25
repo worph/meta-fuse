@@ -535,29 +535,29 @@ List all discovered MetaMesh services.
     "services": [
         {
             "name": "meta-sort",
-            "url": "http://meta-sort-dev",
-            "api": "http://meta-sort-dev/api",
+            "url": "http://metasort-app",
+            "api": "http://metasort-app/api",
             "status": "healthy",
             "role": "writer"
         },
         {
             "name": "meta-fuse",
-            "url": "http://meta-fuse-dev",
-            "api": "http://meta-fuse-dev/api",
+            "url": "http://metafuse-app",
+            "api": "http://metafuse-app/api",
             "status": "healthy",
             "role": "reader"
         },
         {
             "name": "meta-stremio",
-            "url": "http://meta-stremio-dev",
-            "api": "http://meta-stremio-dev/api",
+            "url": "http://metastremio-app",
+            "api": "http://metastremio-app/api",
             "status": "healthy",
             "role": "reader"
         }
     ],
     "current": "meta-fuse",
     "leader": {
-        "hostname": "meta-core-dev",
+        "hostname": "metacore-app",
         "baseUrl": "http://localhost:8083",
         "apiUrl": "http://meta-core:9000",
         "redisUrl": "redis://meta-core:6379",

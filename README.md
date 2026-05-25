@@ -84,7 +84,7 @@ Meta-Fuse is a read-only process in the MetaMesh ecosystem that:
 │  [3] meta-stremio (PROCESS-READ)                                           │
 │      └─► Reads metadata from KV, streams media content                      │
 │                                                                             │
-│  [4] meta-orbit (SHARING-READ-WRITE)                                       │
+│  [4] meta-share (SHARING-READ-WRITE)                                       │
 │      └─► P2P metadata sync across network                                   │
 │                                                                             │
 └────────────────────────────────────────────────────────────────────────────┘
@@ -104,7 +104,7 @@ http://meta-core:9000
 
 /urls API Response (JSON):
 {
-  "hostname": "meta-core-dev",
+  "hostname": "metacore-app",
   "baseUrl": "http://localhost:8083",
   "apiUrl": "http://meta-core:9000",
   "redisUrl": "redis://meta-core:6379",
@@ -606,10 +606,10 @@ journalctl -u meta-fuse-driver -f
 cat /meta-core/locks/kv-leader.info
 
 # Check /urls API
-curl -k https://dev.localhost:8083/api/urls
+curl -k https://metacore-dev.localhost:8083/api/urls
 
 # Verify redis is running (on leader)
-docker exec meta-core-dev redis-cli ping
+docker exec metacore-app redis-cli ping
 
 # Check meta-fuse logs
 docker logs meta-fuse | grep "KV"
@@ -632,10 +632,10 @@ docker logs meta-fuse | grep "wsgidav"
 
 ```bash
 # Check Redis has file data (flat key format)
-docker exec meta-core-dev redis-cli keys "file:*" | head -20
+docker exec metacore-app redis-cli keys "file:*" | head -20
 
 # Check file index
-docker exec meta-core-dev redis-cli scard "file:__index__"
+docker exec metacore-app redis-cli scard "file:__index__"
 
 # Verify source files exist
 ls -la /files/watch/
@@ -644,7 +644,7 @@ ls -la /files/watch/
 curl http://localhost:3000/api/fuse/stats
 
 # Check streaming state builder stats
-docker logs meta-fuse-dev | grep "State builder"
+docker logs metafuse-app | grep "State builder"
 ```
 
 ## Technology Stack
@@ -665,7 +665,7 @@ Meta-Fuse is designed to work seamlessly with other MetaMesh services:
 
 - **meta-sort**: Provides metadata in KV database
 - **meta-stremio**: Can stream files exposed by meta-fuse
-- **meta-orbit**: Syncs metadata across P2P network
+- **meta-share**: Syncs metadata across P2P network
 
 ### Connecting to meta-sort
 
@@ -673,13 +673,13 @@ Ensure meta-sort is running and has processed files:
 
 ```bash
 # Check meta-sort processing status
-curl -k https://dev.localhost:8180/api/processing/status
+curl -k https://metasort-dev.localhost:8180/api/processing/status
 
 # Verify Redis has metadata (via meta-core)
-docker exec meta-core-dev redis-cli scard "file:__index__"
+docker exec metacore-app redis-cli scard "file:__index__"
 
 # Check meta:events stream has events
-docker exec meta-core-dev redis-cli xlen "meta:events"
+docker exec metacore-app redis-cli xlen "meta:events"
 ```
 
 Meta-fuse will automatically discover the KV database through the shared lock file at `/meta-core/locks/kv-leader.info`.
