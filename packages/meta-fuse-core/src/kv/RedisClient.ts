@@ -647,8 +647,16 @@ export class RedisClient implements Partial<IKVClient> {
             mtime,
             ctime: data.ctime ? parseFloat(data.ctime) : mtime,
 
-            // Identification
-            hashId: hashId ?? data.cid_midhash256 ?? data.hashId,
+            // Identification.
+            //
+            // `hashId` is always supplied by the caller — every `parseMetadata`
+            // call site derives it from the Redis key (`file:<hashId>/…`), so the
+            // fallbacks below it were already unreachable. The two that used to sit
+            // here (`data.cid_midhash256`, then `data.hashId`) were also the wrong
+            // shape: `cid_*` fields no longer exist on records, and meta-core
+            // rejects them at the write boundary. Kept as a single defensive `??`
+            // rather than a chain of dead ones. See METADATA_KEYS.md §14.13.
+            hashId: hashId ?? data.hashId,
 
             // Title information
             title: data.title,
