@@ -13,7 +13,6 @@
  */
 export interface MediaMeta {
     // Title information
-    titles?: { eng?: string; [key: string]: string | undefined };
     originalTitle?: string;
     title?: string;
 
@@ -62,7 +61,8 @@ export function renamingRule(metadata: Partial<MediaMeta>, filepath?: string): s
     }
 
     // Get title - try various fields
-    const title = metadata.titles?.eng || metadata.originalTitle;
+    // The display name — never the `titles/*` name set (METADATA_KEYS.md §3).
+    const title = metadata.title || metadata.originalTitle;
     if (!title) {
         if (metadata.fileType !== 'torrent') {
             // Don't warn for torrent files because they don't always have a title

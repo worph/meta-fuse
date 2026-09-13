@@ -21,7 +21,7 @@ export type ConditionOperator =
  */
 export interface Condition {
   type: ConditionOperator;
-  field: string;            // Metadata field path, e.g., "titles.eng", "season", "fileType"
+  field: string;            // Metadata field path, e.g., "title", "season", "fileType"
   value?: string | number | boolean;  // Required for EQUALS, NOT_EQUALS, CONTAINS, MATCHES
 }
 
@@ -83,7 +83,7 @@ export interface PreviewResponse {
  */
 export interface TemplateVariable {
   name: string;         // Display name
-  path: string;         // Field path (e.g., "titles.eng")
+  path: string;         // Field path (e.g., "title")
   type: 'string' | 'number' | 'boolean';
   description: string;
   example?: string;
@@ -93,7 +93,6 @@ export interface TemplateVariable {
  * List of all available template variables
  */
 export const TEMPLATE_VARIABLES: TemplateVariable[] = [
-  { name: 'English Title', path: 'titles.eng', type: 'string', description: 'English title from metadata', example: 'Breaking Bad' },
   { name: 'Original Title', path: 'originalTitle', type: 'string', description: 'Original/native title', example: 'Breaking Bad' },
   { name: 'Title', path: 'title', type: 'string', description: 'Simple title field', example: 'Breaking Bad' },
   { name: 'Season', path: 'season', type: 'number', description: 'Season number', example: '1' },

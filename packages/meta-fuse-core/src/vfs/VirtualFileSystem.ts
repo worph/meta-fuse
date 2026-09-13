@@ -174,12 +174,6 @@ export class VirtualFileSystem implements VFSUpdateCallback {
             mtime = isNaN(parsed) ? parseFloat(props.mtime) : parsed;
         }
 
-        // Parse titles - can be from nested paths like 'titles/eng'
-        let titles: { eng?: string; [key: string]: string | undefined } | undefined;
-        if (props['titles/eng']) {
-            titles = { eng: props['titles/eng'] };
-        }
-
         // Parse season/episode
         const season = props.season !== undefined ? parseInt(props.season, 10) : undefined;
         const episode = props.episode !== undefined ? parseInt(props.episode, 10) : undefined;
@@ -212,7 +206,6 @@ export class VirtualFileSystem implements VFSUpdateCallback {
             ctime: props.ctime ? parseFloat(props.ctime) : mtime,
             hashId,
             title: props.title,
-            titles,
             originalTitle: props.originalTitle,
             fileName,
             season,

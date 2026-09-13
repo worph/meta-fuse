@@ -16,7 +16,7 @@ interface RulesEditorProps {
 // Available metadata fields for conditions
 const AVAILABLE_FIELDS = [
   { value: 'fileType', label: 'File Type', type: 'string' },
-  { value: 'titles.eng', label: 'English Title', type: 'string' },
+  { value: 'title', label: 'Title', type: 'string' },
   { value: 'originalTitle', label: 'Original Title', type: 'string' },
   { value: 'season', label: 'Season', type: 'number' },
   { value: 'episode', label: 'Episode', type: 'number' },
@@ -53,7 +53,7 @@ function createEmptyRule(): RenamingRule {
 function createEmptyCondition(): Condition {
   return {
     type: 'EXISTS',
-    field: 'titles.eng',
+    field: 'title',
   };
 }
 
@@ -197,7 +197,7 @@ function TemplateEditor({ template, onChange, variables }: TemplateEditorProps) 
       <textarea
         value={template}
         onChange={e => onChange(e.target.value)}
-        placeholder="e.g., Movies/{titles.eng|originalTitle}{movieYear? ({movieYear})}/{fileName}.{extension}"
+        placeholder="e.g., Movies/{title|originalTitle}{movieYear? ({movieYear})}/{fileName}.{extension}"
         rows={3}
         className="template-input"
       />

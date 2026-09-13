@@ -7,7 +7,7 @@
  * Old behavior:
  * - Only processes video, subtitle, torrent files
  * - Requires extension
- * - Title from titles.eng || originalTitle
+ * - Title from title || originalTitle
  * - Files without title/extension are hidden (not in Unsorted)
  */
 
