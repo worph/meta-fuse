@@ -70,6 +70,9 @@ async function main(): Promise<void> {
         serviceName: 'meta-fuse',
         apiPort: config.apiPort,
         baseUrl: config.baseUrl,
+        // Pin: when META_CORE_URL is set, UDP discovery never overrides it.
+        // See docs/project-architecture/service-discovery.md.
+        metaCoreUrl: process.env.META_CORE_URL,
         redisPrefix: config.redisPrefix,
     });
 
