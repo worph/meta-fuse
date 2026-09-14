@@ -46,12 +46,14 @@ WORKDIR /build
 # Install FUSE development libraries
 RUN apt-get update && apt-get install -y libfuse3-dev pkg-config
 
-# Copy Rust project
-COPY packages/meta-fuse-driver/Cargo.toml ./
+# Copy Rust project (Cargo.lock included: without it cargo re-resolves every
+# dep to the newest compatible version at build time, which drags in crates
+# whose MSRV is above this image's rustc and breaks the build out of nowhere)
+COPY packages/meta-fuse-driver/Cargo.toml packages/meta-fuse-driver/Cargo.lock ./
 COPY packages/meta-fuse-driver/src/ ./src/
 
-# Build release binary
-RUN cargo build --release
+# Build release binary (--locked: fail loudly instead of silently re-resolving)
+RUN cargo build --release --locked
 
 # Stage 4: Runtime
 FROM ubuntu:22.04
