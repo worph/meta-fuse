@@ -91,9 +91,9 @@ export class APIServer {
     this.app.post('/api/fuse/rules/validate', this.handleValidateRule.bind(this));
     this.app.get('/api/fuse/rules/variables', this.handleGetVariables.bind(this));
 
-    // Service discovery — proxies to meta-core's /api/services, resolving the
-    // current leader's URL via LeaderClient (no hardcoded hostname).
-    this.app.get('/api/services', this.handleServices.bind(this));
+    // meta-discovery v1: neighbours heard over UDP, from this service's own
+    // map — no meta-core needed, so the nav renders even when the core is down.
+    this.app.get('/api/neighbors', this.handleNeighbors.bind(this));
 
     // WebDAV access tokens (per-device basic-auth passwords for /webdav).
     this.app.get('/api/webdav-tokens', this.handleListTokens.bind(this));
@@ -134,35 +134,26 @@ export class APIServer {
   }
 
   /**
-   * Proxy handler that forwards /api/services to meta-core's canonical
-   * registry endpoint using LeaderClient for discovery.
+   * meta-discovery v1 neighbours, served from this service's own UDP map.
+   * `services` is an alias kept while older dashboard builds are around.
    */
-  private async handleServices(_req: FastifyRequest, reply: FastifyReply): Promise<void> {
-    try {
-      const leaderClient = this.kvManager?.getLeaderClient();
-      if (!leaderClient) {
-        reply.status(503).send({ error: 'KVManager not initialized' });
-        return;
-      }
-      const apiUrl = await leaderClient.getApiUrl();
-      if (!apiUrl) {
-        reply.status(503).send({ error: 'Leader not available yet' });
-        return;
-      }
-      const response = await fetch(`${apiUrl}/api/services`, {
-        signal: AbortSignal.timeout(5000),
-      });
-      if (!response.ok) {
-        reply.status(response.status).send({
-          error: `Upstream ${apiUrl} returned ${response.status}`,
-        });
-        return;
-      }
-      reply.send(await response.json());
-    } catch (err: any) {
-      reply.status(502).send({ error: err?.message ?? String(err) });
+  private async handleNeighbors(_request: FastifyRequest, reply: FastifyReply): Promise<void> {
+    const leaderClient = this.kvManager?.getLeaderClient();
+    if (!leaderClient) {
+      void reply.send({ current: 'meta-fuse', enabled: false, count: 0, neighbors: [] });
+      return;
     }
+    const neighbors = leaderClient.getNeighbors();
+    void reply.send({
+      current: 'meta-fuse',
+      enabled: true,
+      count: neighbors.length,
+      neighbors,
+      services: neighbors,
+      self: leaderClient.self(),
+    });
   }
+
 
   /**
    * Start the server
