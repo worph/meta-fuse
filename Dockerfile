@@ -39,7 +39,7 @@ COPY packages/meta-fuse-core/src/ ./src/
 RUN npm run build
 
 # Stage 3: Build FUSE Driver
-FROM rust:1.86-bookworm AS fuse-builder
+FROM rust:1.89-bookworm AS fuse-builder
 
 WORKDIR /build
 
