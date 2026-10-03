@@ -6,12 +6,12 @@ Standalone virtual filesystem service that exposes metadata-organized content vi
 
 Meta-Fuse is a read-only process in the MetaMesh ecosystem that:
 
-1. **Connects to shared KV storage** - Reads metadata from Redis/compatible KV database managed by meta-sort
-2. **Mounts virtual filesystem** - Rust-based FUSE driver creates an organized view of media files
-3. **Serves WebDAV** - Network-accessible file sharing for Windows/Mac/Linux clients
-4. **Zero file duplication** - All content points to original files via WebDAV or direct volume access
-5. **Leader-aware KV access** - Discovers and connects to the active KV database via lock file
-6. **WebDAV file access** - Can read files from meta-sort's WebDAV server (supports SMB/rclone mounts)
+1. **Locates meta-core over UDP** - meta-discovery v1 multicast announce (`239.255.77.1:9399`); no shared volume, no `REDIS_URL`
+2. **Reads metadata through meta-core's HTTP API** - `/meta/{hash}*` reads + SSE live updates on `/api/events/meta` (no direct Redis access)
+3. **Mounts virtual filesystem** - Rust-based FUSE driver creates an organized view of media files
+4. **Serves WebDAV** - Network-accessible, read-only file sharing for Windows/Mac/Linux clients, authenticated with per-device tokens
+5. **Zero file duplication** - File bytes are read from meta-core's WebDAV (`http://<meta-core host>/webdav`), which also covers SMB/rclone mounts; no `/files` mount required
+6. **Configurable renaming rules** - Virtual paths are computed from metadata by editable rules (dashboard rules editor)
 
 ## Architecture
 
@@ -20,29 +20,27 @@ Meta-Fuse is a read-only process in the MetaMesh ecosystem that:
 │                           MetaMesh Ecosystem                                 │
 ├─────────────────────────────────────────────────────────────────────────────┤
 │                                                                              │
-│   DATA Volume (Shared)          KV Database (Leader Election)               │
-│   ┌────────────────────┐        ┌────────────────────────────┐              │
-│   │ /data/watch/       │        │  Redis/Compatible DB        │              │
-│   │ /data/output/      │◄──────┐│  - metadata storage         │              │
-│   │ /mnt/remote/       │       ││  - file paths & attributes  │              │
-│   └────────────────────┘       │└────────────────────────────┘              │
-│            ▲                   │             ▲                               │
-│            │                   │             │ reads                         │
-│            │                   │             │                               │
-│   ┌────────┴───────────────────┴─────────────┴──────────────────┐           │
+│   meta-core (owns Redis)                                                     │
+│   ┌──────────────────────────────────────────────┐                          │
+│   │  UDP announce (meta-discovery v1, /urls)     │                          │
+│   │  HTTP API: /meta/{hash}*, /api/events/meta   │                          │
+│   │  WebDAV: /webdav  (file bytes, /files/...)   │                          │
+│   └──────────────────────────────────────────────┘                          │
+│            ▲ metadata (HTTP + SSE)          ▲ file bytes (WebDAV Range)      │
+│   ┌────────┴────────────────────────────────┴───────────────────┐           │
 │   │                        META-FUSE                             │           │
 │   │  ┌─────────────────────────────────────────────────────────┐│           │
-│   │  │                    KV Client Wrapper                     ││           │
-│   │  │  - Reads lock file for leader discovery                  ││           │
-│   │  │  - Connects to active KV database                        ││           │
-│   │  │  - Reconnect loop for failure handling                   ││           │
+│   │  │       Storage client (KVManager / LeaderClient)          ││           │
+│   │  │  - Locates meta-core via UDP (or META_CORE_URL pin)      ││           │
+│   │  │  - Reads metadata over HTTP, events over SSE             ││           │
+│   │  │  - Reconnects when a different meta-core announces       ││           │
 │   │  └─────────────────────────────────────────────────────────┘│           │
 │   │                            │                                 │           │
 │   │              ┌─────────────┴─────────────┐                  │           │
 │   │              ▼                           ▼                  │           │
 │   │  ┌───────────────────────┐   ┌─────────────────────────┐   │           │
 │   │  │    FUSE API Server    │   │    WebDAV Server        │   │           │
-│   │  │    (Node.js/Fastify)  │   │    (WsgiDAV)            │   │           │
+│   │  │    (Node.js/Fastify)  │   │    (WsgiDAV, token auth)│   │           │
 │   │  │    Port 3000          │   │    Port 8080            │   │           │
 │   │  └───────────┬───────────┘   └───────────┬─────────────┘   │           │
 │   │              │                           │                  │           │
@@ -56,10 +54,11 @@ Meta-Fuse is a read-only process in the MetaMesh ecosystem that:
 │                            │                                                 │
 │                            ▼                                                 │
 │              ┌─────────────────────────┐                                    │
-│              │    nginx Reverse Proxy  │                                    │
+│              │    nginx (port 80)      │                                    │
 │              │    /           → UI     │                                    │
 │              │    /webdav     → WebDAV │                                    │
-│              │    /api/fuse   → API    │                                    │
+│              │    /api/       → API    │                                    │
+│              │    /health     → API    │                                    │
 │              └─────────────────────────┘                                    │
 │                            │                                                 │
 └────────────────────────────┼────────────────────────────────────────────────┘
@@ -68,6 +67,8 @@ Meta-Fuse is a read-only process in the MetaMesh ecosystem that:
                     (Windows/Mac/Linux)
 ```
 
+In the dev stack and the CasaOS store app (`packages/MetaAppStore`, app `MetaFuse`) the backend runs as `metafuse-app` behind an OIDC perimeter container `metafuse` (`nginx-hash-lock` in dev, `appshield` in the store app); in the store app Caddy routes `/health` and `/webdav*` straight to the backend, so WebDAV is authenticated by WebDAV tokens instead. See the meta-root [authentication architecture](../../docs/project-architecture/authentication.md).
+
 ### Service Role in MetaMesh
 
 ```
@@ -75,54 +76,45 @@ Meta-Fuse is a read-only process in the MetaMesh ecosystem that:
 │  SERVICE ROLES                                                              │
 ├────────────────────────────────────────────────────────────────────────────┤
 │                                                                             │
-│  [1] meta-sort (PROCESS-WRITE)                                             │
-│      └─► Writes metadata to KV, manages remote mounts                       │
+│  [1] meta-core (STORE)                                                      │
+│      └─► Owns Redis, metadata HTTP API, event streams, WebDAV over /files   │
 │                                                                             │
-│  [2] meta-fuse (PROCESS-READ) ◄── YOU ARE HERE                             │
-│      └─► Reads metadata from KV, exposes virtual filesystem                 │
+│  [2] meta-sort (PROCESS-WRITE)                                              │
+│      └─► Watches folders, writes metadata through meta-core                 │
 │                                                                             │
-│  [3] meta-stremio (PROCESS-READ)                                           │
-│      └─► Reads metadata from KV, streams media content                      │
+│  [3] meta-fuse (PROCESS-READ) ◄── YOU ARE HERE                              │
+│      └─► Reads metadata from meta-core, exposes virtual filesystem          │
 │                                                                             │
-│  [4] meta-share (SHARING-READ-WRITE)                                       │
-│      └─► P2P metadata sync across network                                   │
+│  [4] meta-stremio (PROCESS-READ)                                            │
+│      └─► Reads metadata, streams media content                              │
 │                                                                             │
 └────────────────────────────────────────────────────────────────────────────┘
 ```
 
-### KV Leader Election
+### Locating meta-core (meta-discovery v1)
 
-All services in MetaMesh use leader discovery via meta-core's lock file and HTTP API:
+meta-core announces itself on UDP multicast `239.255.77.1:9399`, carrying its `/urls` payload. meta-fuse listens (and announces itself on the same group, so it shows up in every neighbour's nav menu):
 
 ```
-/meta-core/locks/
-├── kv-leader.lock      # flock-based leader election
-└── kv-leader.info      # Leader API URL (plain text)
-
-Lock Info File Format (plain text):
-http://meta-core:9000
-
-/urls API Response (JSON):
+/urls payload (JSON):
 {
   "hostname": "metacore-app",
-  "baseUrl": "http://localhost:8083",
-  "apiUrl": "http://meta-core:9000",
-  "redisUrl": "redis://meta-core:6379",
-  "webdavUrl": "http://localhost:8083/webdav",
-  "webdavUrlInternal": "http://meta-core:9000/webdav",
-  "isLeader": true
+  "baseUrl": "https://metacore-dev.localhost:8083",
+  "apiUrl": "http://<meta-core ip>:9000",
+  "redisUrl": "",                       # always empty since the api-mediated-access lockdown
+  "webdavUrl": "https://metacore-dev.localhost:8083/webdav",
+  "webdavUrlInternal": "http://<meta-core ip>:9000/webdav"
 }
 
-Leader Discovery Flow:
-1. meta-core acquires flock on kv-leader.lock
-2. Winner (leader) spawns Redis, writes API URL to kv-leader.info
-3. meta-fuse reads kv-leader.info to find API URL
-4. meta-fuse calls /urls API to get Redis URL and other endpoints
-5. meta-fuse connects to Redis as read-only client
-6. On leader failure, flock auto-releases, new leader elected
+Discovery flow:
+1. meta-core announces role=core with its /urls payload
+2. meta-fuse picks it up (or uses META_CORE_URL and GET {url}/urls when pinned)
+3. meta-fuse reads metadata from apiUrl (/meta/{hash}*) and streams apiUrl/api/events/meta
+4. File bytes are fetched from http://<hostname>/webdav
+5. An announce carrying a different apiUrl triggers a reconnect
 ```
 
-**Note**: meta-fuse never becomes leader - it reads the lock file and calls the /urls API to discover the active Redis endpoint managed by meta-core.
+**Note**: meta-fuse never owns storage. If meta-core still publishes a non-empty `redisUrl`, meta-fuse refuses to start (set `ALLOW_LEGACY_REDIS_URL=1` to downgrade that to a warning). Protocol spec: [service-discovery.md](../../docs/project-architecture/service-discovery.md).
 
 ## Core Features
 
@@ -132,21 +124,21 @@ Leader Discovery Flow:
 - **Path-to-inode mapping**: Translates filesystem paths to FUSE inode numbers
 - **Attribute caching**: 1-second TTL for file attributes
 - **Directory caching**: 30-second TTL for directory listings
-- **Error resilience**: Virtual ERROR.txt shown when backend unavailable
+- **Error resilience**: Virtual `ERROR.txt` shown after 3 consecutive API failures
+- **WebDAV reads**: The driver issues HTTP Range requests against the `webdavUrl` returned by `/api/fuse/read`
 
 ### WebDAV Server
 
 - **Network file sharing**: Mount as network drive on any OS
 - **Read-only access**: Prevents accidental modifications
-- **Basic authentication**: Username/password protection
+- **Per-device tokens**: Minted/revoked from the dashboard (`/api/webdav-tokens`); the token (`mfwd_…`) is the basic-auth password, any non-empty username is accepted. Only sha256 hashes are stored (`$CONFIG_DIR/webdav-tokens.json`); revocation is immediate
 - **Directory browsing**: Web-based file browser
 
-### KV Client Wrapper
+### Renaming Rules
 
-- **Leader discovery**: Reads lock file to find active database
-- **Auto-reconnect**: Handles leader failover gracefully
-- **Connection pooling**: Efficient database connections
-- **Read-only operations**: No writes to KV database
+- Stored in `$CONFIG_DIR/renaming-rules.json` (timestamped backups on update)
+- Template variables + conditions; preview and validate via the API before saving
+- Only the metadata properties the rules reference are fetched (`RulesPropertyExtractor`)
 
 ## Package Structure
 
@@ -155,16 +147,16 @@ meta-fuse/
 ├── packages/
 │   ├── meta-fuse-core/         # Core service (@meta-fuse/core)
 │   │   ├── src/
-│   │   │   ├── api/            # Fastify REST API (APIServer)
-│   │   │   │   └── APIServer.ts
-│   │   │   ├── config/         # Configuration management
-│   │   │   │   └── ConfigStorage.ts
-│   │   │   ├── kv/             # KV client wrapper (FOLLOWER mode only)
+│   │   │   ├── api/APIServer.ts        # Fastify REST API
+│   │   │   ├── config/ConfigStorage.ts # Renaming-rules persistence
+│   │   │   ├── discovery/meshdisco.ts  # meta-discovery v1 (mirrored, see scripts/check-mirrors.sh)
+│   │   │   ├── kv/                     # Storage client (read-only)
 │   │   │   │   ├── IKVClient.ts        # Read-only interface
-│   │   │   │   ├── KVManager.ts        # Leader discovery, connection management
-│   │   │   │   ├── LeaderClient.ts     # Lock file reading + /urls API
-│   │   │   │   ├── RedisClient.ts      # Redis connection with Streams support
-│   │   │   │   └── ServiceDiscovery.ts # Service discovery client
+│   │   │   │   ├── KVManager.ts        # meta-core location, connection management
+│   │   │   │   ├── LeaderClient.ts     # Adapter over MetaCoreLocator (UDP / META_CORE_URL pin)
+│   │   │   │   ├── MetaCoreApiClient.ts # HTTP reads: /meta, /meta/{hash}, /meta/{hash}/{prop}
+│   │   │   │   ├── SSEEventClient.ts   # SSE consumer for /api/events/meta
+│   │   │   │   └── RedisClient.ts      # Storage facade (HTTP-only mode when redisUrl is empty)
 │   │   │   ├── vfs/            # Virtual filesystem logic
 │   │   │   │   ├── VirtualFileSystem.ts       # In-memory VFS representation
 │   │   │   │   ├── StreamingStateBuilder.ts   # Event-driven state management
@@ -172,146 +164,123 @@ meta-fuse/
 │   │   │   │   ├── MetaDataToFolderStruct.ts  # Folder organization
 │   │   │   │   ├── RenamingRule.ts            # Virtual path rules
 │   │   │   │   ├── defaults/                  # Default renaming rules
-│   │   │   │   ├── template/                  # Template engine components
-│   │   │   │   │   ├── TemplateEngine.ts      # Variable interpolation
-│   │   │   │   │   └── ConditionEvaluator.ts  # Rule condition evaluation
-│   │   │   │   └── types/                     # TypeScript type definitions
-│   │   │   │       └── RenamingRuleTypes.ts
+│   │   │   │   ├── template/                  # TemplateEngine, ConditionEvaluator
+│   │   │   │   └── types/                     # RenamingRuleTypes.ts
+│   │   │   ├── webdav/TokenStore.ts    # Per-device WebDAV tokens
 │   │   │   └── index.ts        # Entry point
 │   │   ├── package.json
 │   │   └── tsconfig.json
 │   │
-│   ├── meta-fuse-driver/       # Rust FUSE driver
+│   ├── meta-fuse-driver/       # Rust FUSE driver (fuser)
 │   │   ├── src/
-│   │   │   ├── main.rs         # Entry point
-│   │   │   ├── api_client.rs   # HTTP client to API server
-│   │   │   └── inode_mapper.rs # Path-to-inode mapping
-│   │   └── Cargo.toml
+│   │   │   ├── main.rs         # Entry point, FUSE ops, inode mapping
+│   │   │   └── api_client.rs   # HTTP client to API server
+│   │   ├── Cargo.toml
+│   │   └── Cargo.lock
 │   │
-│   └── meta-fuse-ui/           # Monitoring dashboard (optional)
-│       ├── src/
-│       └── package.json
+│   └── meta-fuse-ui/           # Dashboard (Vite + React): stats, rules editor, WebDAV tokens
 │
 ├── docs/                       # Architecture documentation
-│   ├── vfs-rebuild-architecture.md
-│   ├── streaming-architecture.md
-│   └── api-reference.md
-│
 ├── docker/
-│   ├── nginx.conf              # Reverse proxy config
-│   ├── wsgidav.yaml            # WebDAV server config
-│   ├── supervisord.conf        # Process management
-│   └── entrypoint.sh           # Service orchestration
+│   ├── nginx.conf                   # Reverse proxy config
+│   ├── wsgidav.yaml                 # WebDAV server config
+│   ├── webdav_token_controller.py   # WsgiDAV DomainController (token auth)
+│   ├── supervisord.conf             # Process management
+│   ├── start-fuse-driver.sh         # Waits for the API, then mounts
+│   └── welcome.html
 │
 ├── Dockerfile
-├── docker-compose.yml
+├── docker-compose.yml          # Legacy standalone example (see note below)
 ├── package.json                # Workspace root
-├── pnpm-workspace.yaml
-└── README.md
+└── pnpm-workspace.yaml
 ```
 
 ### Key Components (meta-fuse-core)
 
 | Component | File | Purpose |
 |-----------|------|---------|
-| Entry Point | `src/index.ts` | Initializes KV manager, VFS, API server, stream consumer |
-| API Server | `src/api/APIServer.ts` | Fastify REST API for FUSE operations and rules management |
-| KV Manager | `src/kv/KVManager.ts` | **FOLLOWER-only**: leader discovery, Redis connection, reconnection loop |
-| Leader Client | `src/kv/LeaderClient.ts` | Reads `/meta-core/locks/kv-leader.info`, calls `/urls` API |
-| Redis Client | `src/kv/RedisClient.ts` | Wrapper around ioredis with Redis Streams support |
-| Service Discovery | `src/kv/ServiceDiscovery.ts` | Discovers all MetaMesh services via service files |
-| KV Interface | `src/kv/IKVClient.ts` | Read-only interface (get, scan, subscribe) |
+| Entry Point | `src/index.ts` | Initializes KV manager, VFS, SSE consumer, API server |
+| API Server | `src/api/APIServer.ts` | Fastify REST API for FUSE operations, rules, tokens, neighbours |
+| KV Manager | `src/kv/KVManager.ts` | Never owns storage: locates meta-core, builds the client, reconnects |
+| Leader Client | `src/kv/LeaderClient.ts` | Locates meta-core over UDP (name is legacy: no election involved) |
+| meta-core API Client | `src/kv/MetaCoreApiClient.ts` | `/meta/{hash}/{prop}`, `/meta/{hash}`, `/meta` reads |
+| SSE Event Client | `src/kv/SSEEventClient.ts` | Consumes `/api/events/meta` (replays from `0-0` every start) |
 | Virtual FS | `src/vfs/VirtualFileSystem.ts` | In-memory VFS representation with caching |
-| Streaming State Builder | `src/vfs/StreamingStateBuilder.ts` | Processes `meta:events` stream, builds VFS state incrementally |
+| Streaming State Builder | `src/vfs/StreamingStateBuilder.ts` | Turns `meta:events` into VFS state incrementally |
 | Rules Property Extractor | `src/vfs/RulesPropertyExtractor.ts` | Extracts VFS-relevant properties from renaming rules |
 | Folder Organizer | `src/vfs/MetaDataToFolderStruct.ts` | Converts flat metadata to organized folder structure |
-| Renaming Rules | `src/vfs/RenamingRule.ts` | Rules for virtual path organization |
 | Template Engine | `src/vfs/template/TemplateEngine.ts` | Variable interpolation for renaming templates |
 | Condition Evaluator | `src/vfs/template/ConditionEvaluator.ts` | Evaluates rule conditions against file metadata |
-
-**Note**: Unlike meta-sort, meta-fuse's KVManager is simplified:
-- **Never spawns Redis** (always FOLLOWER)
-- **Only reads metadata** (read-only interface)
-- **Discovers leader** via lock file at `/meta-core/locks/kv-leader.info`
-- **Calls `/urls` API** to get Redis URL, WebDAV URL, and other endpoints
-- **Uses streaming mode** - processes `meta:events` stream for real-time updates
+| Token Store | `src/webdav/TokenStore.ts` | Mints/lists/revokes WebDAV tokens |
 
 ## Configuration
 
 ### Environment Variables
 
 ```bash
-# Volume Paths
-META_CORE_PATH=/meta-core                           # Infrastructure volume (locks, services)
-FILES_VOLUME=/files                                 # Shared media volume
+# meta-core location
+META_CORE_URL=                                      # Pin meta-core's API URL; UDP discovery never overrides it
+ENABLE_UDP_DISCOVERY=true                           # false/0 disables meta-discovery
+ALLOW_LEGACY_REDIS_URL=                             # 1 = warn instead of fail if meta-core publishes redisUrl
 
-# KV Connection
-REDIS_URL=                                          # Direct Redis URL (optional, skips discovery)
-REDIS_PREFIX=meta-sort:                             # Key prefix in Redis
+# Announce / nav menu
+BASE_URL=                                           # External (Caddy) URL
+PUBLIC_URL=                                         # Wins over BASE_URL (debug-direct port, no Caddy)
+
+# Paths
+FILES_VOLUME=/files                                 # Prefix for the relative filePath of each record
+CONFIG_DIR=/meta-fuse/config                        # renaming-rules.json, webdav-tokens.json
 
 # API Server
 API_PORT=3000                                       # API server port
 API_HOST=0.0.0.0                                    # API bind address
-VFS_REFRESH_INTERVAL=30000                          # VFS cache refresh interval (ms)
 
-# FUSE Driver
-FUSE_MOUNT_POINT=/mnt/virtual                       # Virtual filesystem mount
-FUSE_API_URL=http://localhost:3000                  # API server URL
+# VFS attributes (core)
 FUSE_FILE_MODE=644                                  # File permissions (octal)
 FUSE_DIR_MODE=755                                   # Directory permissions (octal)
-FUSE_ALLOW_OTHER=true                               # Allow other users
+PUID=1000                                           # File owner uid (core + driver)
+PGID=1000                                           # File owner gid (core + driver)
 
-# User/Group
-PUID=1000                                           # User ID for files
-PGID=1000                                           # Group ID for files
+# FUSE driver (args: <mountpoint> [api-url] [uid] [gid])
+FUSE_API_URL=http://localhost:3000                  # Used when api-url arg is omitted
+FUSE_FILE_PERM / FUSE_DIR_PERM                      # Driver-side permission overrides
+                                                    # Mount always uses allow_other (needs user_allow_other in /etc/fuse.conf)
 
-# WebDAV (serving files to clients)
-WEBDAV_PORT=8080                                    # WebDAV server port
-WEBDAV_USERNAME=metamesh                            # WebDAV username
-WEBDAV_PASSWORD=metamesh                            # WebDAV password
-WEBDAV_READONLY=true                                # Read-only mode
-
-# meta-core WebDAV Access (reading files from meta-core)
-META_CORE_WEBDAV_URL=http://meta-core/webdav        # URL to access files via meta-core's WebDAV
-                                                    # Enables access to SMB/rclone mounts
+# WsgiDAV
+TOKEN_STORE_PATH=/meta-fuse/config/webdav-tokens.json
 ```
 
 ### Docker Compose
 
-```yaml
-version: '3.8'
+The CasaOS store app (`packages/MetaAppStore/Apps/MetaFuse/docker-compose.yml`) is the reference deployment. Trimmed:
 
+```yaml
 services:
-  meta-fuse:
-    build: .
-    container_name: meta-fuse
-    restart: unless-stopped
+  metafuse-app:
+    image: ghcr.io/worph/meta-fuse:<version>
     privileged: true                    # Required for FUSE
-    cap_add:
-      - SYS_ADMIN
+    cap_add: [SYS_ADMIN, DAC_READ_SEARCH, DAC_OVERRIDE]
     devices:
-      - /dev/fuse
-    ports:
-      - "80:80"                         # nginx (WebDAV, API)
+      - /dev/fuse:/dev/fuse
+    security_opt:
+      - apparmor:unconfined
+    expose:
+      - 80                              # nginx (UI, API, WebDAV)
     volumes:
-      # Infrastructure volume (read-only for followers)
-      - ${META_CORE_PATH:-./data/meta-core}:/meta-core:ro
-      # Shared media volume (read-only)
-      - ${FILES_PATH:-./data/files}:/files:ro
-      # FUSE mount output (if exposing to host)
-      - /mnt/metamesh:/mnt/virtual:rw,shared
+      # No /meta-core mount (UDP discovery), no /files mount (WebDAV via meta-core)
+      - ${DATA_ROOT:-/DATA}/MetaFuse/Library:/mnt/virtual:shared   # FUSE mount output
+      - ${DATA_ROOT:-/DATA}/AppData/metafuse/config:/meta-fuse/config:rw
     environment:
-      - META_CORE_PATH=/meta-core
-      - FILES_VOLUME=/files
-      - FUSE_MOUNT_POINT=/mnt/virtual
-      - REDIS_PREFIX=meta-sort:
-      # Optional: Read files via meta-core WebDAV (enables SMB/rclone mount access)
-      - META_CORE_WEBDAV_URL=http://meta-core/webdav
+      - CONFIG_DIR=/meta-fuse/config
+      - BASE_URL=https://metafuse-$APP_DOMAIN
+    networks: [pcs]                     # must share a multicast-capable network with meta-core
 ```
+
+The repo-root `docker-compose.yml` predates meta-core (it sets `REDIS_URL` and mounts `/data`) and is not representative.
 
 ## API Endpoints
 
-### FUSE API (Port 3000)
+### FUSE API (Port 3000, proxied by nginx under `/api/` and `/health`)
 
 | Method | Endpoint | Description |
 |--------|----------|-------------|
@@ -324,35 +293,34 @@ services:
 | POST | `/api/fuse/readdir` | List directory contents |
 | POST | `/api/fuse/getattr` | Get file/directory attributes |
 | POST | `/api/fuse/exists` | Check path existence |
-| POST | `/api/fuse/read` | Read file content (returns source path or WebDAV URL) |
+| POST | `/api/fuse/read` | Resolve file content (source path / WebDAV URL) |
 | POST | `/api/fuse/metadata` | Get full metadata for a path |
 | GET | `/api/fuse/files` | List all virtual files |
 | GET | `/api/fuse/directories` | List all virtual directories |
-| POST | `/api/fuse/refresh` | Trigger VFS refresh |
+| POST | `/api/fuse/refresh` | Trigger VFS refresh (replays the event stream) |
 | **Renaming Rules** |
 | GET | `/api/fuse/rules` | Get current renaming rules configuration |
 | PUT | `/api/fuse/rules` | Update renaming rules configuration |
 | POST | `/api/fuse/rules/preview` | Preview how files would be renamed |
 | POST | `/api/fuse/rules/validate` | Validate a single rule |
 | GET | `/api/fuse/rules/variables` | Get list of available template variables |
+| **WebDAV Tokens** |
+| GET | `/api/webdav-tokens` | List tokens (hashes/prefixes only) |
+| POST | `/api/webdav-tokens` | Create a token (`{ "label": "..." }`); plaintext returned once |
+| DELETE | `/api/webdav-tokens/:id` | Revoke a token |
 | **Service Discovery** |
-| GET | `/api/services` | List all discovered MetaMesh services |
+| GET | `/api/neighbors` | Services heard over meta-discovery v1 (nav menu) |
 
 ### Example Responses
 
 **GET /api/fuse/stats**
 ```json
 {
-  "totalFiles": 1523,
-  "totalDirectories": 48,
+  "fileCount": 1523,
+  "directoryCount": 48,
   "totalSize": 1847392847362,
-  "categories": {
-    "Movies": 523,
-    "TV": 412,
-    "Anime": 588
-  },
-  "kvConnection": "connected",
-  "fuseMount": "mounted"
+  "lastRefresh": "2026-01-15T10:30:00.000Z",
+  "redisConnected": true
 }
 ```
 
@@ -363,12 +331,7 @@ services:
 
 // Response
 {
-  "entries": [
-    "Action",
-    "Comedy",
-    "Drama",
-    "Sci-Fi"
-  ]
+  "entries": ["Action", "Comedy", "Drama", "Sci-Fi"]
 }
 ```
 
@@ -377,66 +340,54 @@ services:
 // Request
 { "path": "/Movies/Action/Movie.mkv" }
 
-// Response
+// Response (mode includes the file-type bits; times are epoch seconds)
 {
   "size": 4831838208,
-  "mode": "file",
-  "permissions": 644,
-  "atime": "2024-01-15T10:30:00Z",
-  "mtime": "2024-01-15T10:30:00Z",
-  "ctime": "2024-01-15T10:30:00Z",
-  "sourcePath": "/data/watch/downloads/Movie.2024.1080p.mkv"
+  "mode": 33188,
+  "mtime": 1705314600,
+  "atime": 1705314600,
+  "ctime": 1705314600,
+  "nlink": 1,
+  "uid": 1000,
+  "gid": 1000
 }
 ```
 
 ## Usage
 
-### Docker (Recommended)
+### Docker
 
 ```bash
-# Start meta-fuse service
-docker-compose up -d
+# Build the image (bundles UI, backend, FUSE driver, WsgiDAV, nginx)
+docker build -t meta-fuse .
 
-# View logs
-docker logs -f meta-fuse
-
-# Check health
-curl http://localhost/api/fuse/health
+# Check health (through nginx on port 80)
+curl http://localhost/health
 ```
 
-### Mount WebDAV (Windows)
+Images are published to `ghcr.io/worph/meta-fuse` by `.github/workflows/docker-publish.yml`. In the meta-root dev stack the service is `metafuse-app` (`https://metafuse-dev.localhost:8181` via Caddy, debug-direct `http://localhost:18181`); rebuild it with `dev/scripts/reload-meta-fuse.sh`.
+
+### Mount WebDAV
+
+Create a token in the dashboard (WebDAV tokens panel) first; use it as the password. The username can be anything non-empty.
 
 ```powershell
-# Map network drive
-net use Z: http://localhost/webdav /user:metamesh metamesh
-
-# Access files
+# Windows
+net use Z: https://<metafuse host>/webdav /user:me mfwd_xxxxxxxx
 dir Z:\Movies
 ```
 
-### Mount WebDAV (Linux)
-
 ```bash
-# Install davfs2
+# Linux (davfs2)
 sudo apt-get install davfs2
-
-# Create mount point
 mkdir -p ~/meta-fuse
-
-# Mount
-sudo mount -t davfs http://localhost/webdav ~/meta-fuse
-# Enter credentials: metamesh / metamesh
-
-# Access files
+sudo mount -t davfs https://<metafuse host>/webdav ~/meta-fuse
+# Credentials: any username / your mfwd_ token
 ls ~/meta-fuse/Movies
 ```
 
-### Mount WebDAV (macOS)
-
 ```bash
-# Using Finder: Go → Connect to Server
-# Enter: http://localhost/webdav
-# Credentials: metamesh / metamesh
+# macOS: Finder → Go → Connect to Server → https://<metafuse host>/webdav
 ```
 
 ## Development
@@ -444,39 +395,30 @@ ls ~/meta-fuse/Movies
 ### Prerequisites
 
 - Node.js 21.6.2+
-- pnpm 10.19.0+
-- Rust 1.90+ (for FUSE driver)
+- pnpm
+- Rust 1.89+ (for FUSE driver; the Dockerfile builds with `rust:1.89-bookworm`)
 - Docker & Docker Compose
 
 ### Local Development
 
 ```bash
-# Install dependencies
 pnpm install
-
-# Build all packages
-pnpm run build
-
-# Start development mode
-pnpm run dev
-
-# Run tests
-pnpm run test
-
-# Lint
+pnpm run build     # all packages
+pnpm run dev       # tsc --watch (core) + vite (ui), in parallel
+pnpm run test      # @meta-fuse/core (mocha)
 pnpm run lint
 ```
+
+Inside the meta-root, prefer the dev stack's in-container build (`dev/scripts/reload-meta-fuse.sh`) — see the meta-root [CLAUDE.md](../../CLAUDE.md).
 
 ### Building FUSE Driver
 
 ```bash
 cd packages/meta-fuse-driver
-cargo build --release
+cargo build --release --locked
 
-# Run driver
-./target/release/meta-fuse-driver \
-  --mount-point /mnt/virtual \
-  --api-url http://localhost:3000
+# Run driver: <mountpoint> [api-url] [uid] [gid]
+./target/release/meta-fuse-driver /mnt/virtual http://localhost:3000
 ```
 
 ### Project Scripts
@@ -485,9 +427,9 @@ cargo build --release
 |---------|-------------|
 | `pnpm run build` | Build all packages |
 | `pnpm run dev` | Development mode with hot reload |
-| `pnpm run start:core` | Start core service |
-| `pnpm run start:driver` | Start FUSE driver |
-| `pnpm run test` | Run all tests |
+| `pnpm run start` / `start:core` | Start core service |
+| `pnpm run start:ui` | Start UI dev server |
+| `pnpm run test` | Run core tests |
 | `pnpm run lint` | Lint all packages |
 
 ## How It Works
@@ -498,86 +440,56 @@ cargo build --release
 1. Client opens /mnt/virtual/Movies/Action/Movie.mkv
                     │
                     ▼
-2. FUSE driver receives read request
+2. FUSE driver receives the request
    - Converts path to inode
-   - Calls API: POST /api/fuse/getattr
+   - Calls API: POST /api/fuse/getattr, then /api/fuse/read
                     │
                     ▼
-3. API server queries KV database
-   - Looks up metadata by virtual path
-   - Returns sourcePath pointing to actual file
+3. API server resolves the path from its in-memory VFS
+   - Returns a webdavUrl on meta-core's WebDAV for the source file
                     │
                     ▼
-4. FUSE driver reads from sourcePath
-   - /data/watch/downloads/Movie.2024.1080p.mkv
+4. FUSE driver reads byte ranges from that URL (HTTP Range)
                     │
                     ▼
 5. Content streamed to client
    - No file duplication
-   - Direct read from original location
+   - Bytes come from the original location via meta-core
 ```
 
-### KV Data Structure
+### Metadata Access
 
-meta-fuse reads metadata stored by meta-sort using flat Redis keys:
+meta-fuse never talks to Redis. It reads records through meta-core's HTTP API:
 
 ```
-# File metadata stored by meta-sort (flat key format)
-file:{hashId}/title          → "Inception"
-file:{hashId}/year           → "2010"
-file:{hashId}/filePath       → "media1/Movies/Inception (2010)/Inception.mkv"
-file:{hashId}/size           → 4831838208
-file:{hashId}/video/codec    → "h265"
-file:{hashId}/titles/eng     → "Inception"
+GET /meta                    → { hashIds: [...] }       enumerate records
+GET /meta/{hash}             → { metadata: {...} }      full flat record
+GET /meta/{hash}/{prop}      → text/plain value        one property (e.g. titles/eng)
 
-# File index for enumeration
-file:__index__               → SET of all hashIds
-
-# VFS paths are computed dynamically from metadata
-# meta-fuse builds virtual paths like:
+# VFS paths are computed from metadata by the renaming rules, e.g.
 #   /Movies/Inception (2010)/Inception.mkv
-#   → resolves to sourcePath: /files/media1/Movies/Inception (2010)/Inception.mkv
+#   → filePath "media1/Movies/Inception (2010)/Inception.mkv" (relative to FILES_VOLUME)
 ```
 
-**Key Format**: `file:{hashId}/{property}` where:
-- `hashId` is the midhash256 content identifier
-- `property` can be flat (e.g., `title`) or nested (e.g., `titles/eng`)
+Field names and value formats: meta-root [METADATA_KEYS.md](../../METADATA_KEYS.md). File paths are **relative to FILES_VOLUME** (`/files`).
 
-**Note**: File paths in Redis are **relative to FILES_VOLUME** (`/files`). meta-fuse prepends the FILES_VOLUME path when resolving actual file locations.
+### Real-Time Updates via SSE
 
-### Real-Time Updates via Redis Streams
-
-meta-fuse uses the `meta:events` Redis Stream for real-time metadata updates. The streaming architecture provides:
-- **Reliable delivery** - Messages persist until consumed
-- **Replay capability** - Can rebuild state from stream position 0
-- **Memory efficiency** - Only VFS-relevant properties are fetched
+meta-fuse consumes meta-core's `meta:events` stream through SSE at `GET {apiUrl}/api/events/meta`. Each event is a property change:
 
 ```typescript
-// Stream message format (meta:events)
-interface StreamMessage {
+// SSE event → StreamMessage
+{
     id: string;           // Stream entry ID (e.g., "1703808000000-0")
-    type: 'set' | 'del';  // Operation type
-    key: string;          // Redis key (e.g., "file:abc123/title")
-    ts: string;           // Timestamp
+    type: 'set' | 'del';  // SSE event name
+    key: string;          // e.g. "file:abc123/title"
 }
 ```
 
 **Startup Sequence**:
-1. **Streaming Bootstrap**: Replay `meta:events` stream from position 0
-2. **Build State**: Process each event, fetch only VFS-relevant properties
-3. **Go Live**: Continue consuming new events from last processed position
-
-**Event Processing Pipeline**:
-1. Parse key to extract `hashId` and `property`
-2. Check if property is VFS-relevant (based on renaming rules)
-3. If relevant, fetch property value from Redis
-4. Update internal state and notify VFS
-5. When file has `filePath`, it appears in VFS
-
-This streaming architecture enables:
-- Sub-second startup (no HGETALL/SCAN)
-- Memory-efficient state (~500 bytes/file)
-- Real-time VFS updates as files are processed
+1. **Bootstrap**: VFS state is held only in memory, so every start replays from cursor `0-0` (the cursor is deliberately not persisted; a `gap` event resumes from the oldest retained entry)
+2. **Build State**: Parse `file:{hashId}/{property}`, skip properties the rules don't use, fetch the rest
+3. **Go Live**: Keep consuming new events; a file appears in the VFS once it has a `filePath`
 
 ---
 
@@ -586,65 +498,42 @@ This streaming architecture enables:
 ### FUSE Mount Not Working
 
 ```bash
-# Check if FUSE is available
-ls -la /dev/fuse
-
-# Verify mount
-mount | grep virtual
-
-# Check API health
-curl http://localhost:3000/api/fuse/health
-
-# View driver logs
-journalctl -u meta-fuse-driver -f
+ls -la /dev/fuse                     # FUSE available?
+mount | grep virtual                 # mounted?
+curl http://localhost/api/fuse/health
+# Driver logs (inside the container)
+tail -f /var/log/supervisor/fuse-driver.log /var/log/supervisor/fuse-driver_error.log
 ```
 
-### KV Connection Failed
+### meta-core Not Found
 
 ```bash
-# Check lock file exists
-cat /meta-core/locks/kv-leader.info
+# Who this service hears over UDP
+curl http://localhost/api/neighbors
 
-# Check /urls API
+# meta-core's own view + URLs
+curl -k https://metacore-dev.localhost:8083/api/neighbors
 curl -k https://metacore-dev.localhost:8083/api/urls
 
-# Verify redis is running (on leader)
-docker exec metacore-app redis-cli ping
-
-# Check meta-fuse logs
-docker logs meta-fuse | grep "KV"
+# meta-fuse logs
+docker logs metafuse-app | grep -E "LeaderClient|KVManager|SSE"
 ```
+
+If multicast can't cross your network, pin it with `META_CORE_URL`.
 
 ### WebDAV Not Accessible
 
 ```bash
-# Check WebDAV health
-curl -u metamesh:metamesh http://localhost/webdav/
-
-# Verify nginx is proxying
-curl -I http://localhost/webdav
-
-# Check WsgiDAV logs
-docker logs meta-fuse | grep "wsgidav"
+curl -u me:mfwd_xxxxxxxx http://localhost/webdav/   # 401 = bad/revoked token
+docker exec metafuse-app tail /var/log/supervisor/wsgidav_error.log
 ```
 
 ### Files Not Appearing
 
 ```bash
-# Check Redis has file data (flat key format)
-docker exec metacore-app redis-cli keys "file:*" | head -20
-
-# Check file index
-docker exec metacore-app redis-cli scard "file:__index__"
-
-# Verify source files exist
-ls -la /files/watch/
-
-# Check API stats
-curl http://localhost:3000/api/fuse/stats
-
-# Check streaming state builder stats
+curl http://localhost/api/fuse/stats
 docker logs metafuse-app | grep "State builder"
+curl -k https://metacore-dev.localhost:8083/api/stats   # does meta-core have records?
 ```
 
 ## Technology Stack
@@ -654,44 +543,32 @@ docker logs metafuse-app | grep "State builder"
 | Core Service | Node.js + TypeScript | API server, VFS logic |
 | HTTP Framework | Fastify 5.x | REST API |
 | FUSE Driver | Rust + fuser | Filesystem interface |
-| WebDAV | WsgiDAV (Python) | Network file sharing |
-| KV Database | Redis (via ioredis) | Metadata storage |
+| WebDAV | WsgiDAV (Python) + token DomainController | Network file sharing |
+| Metadata | meta-core HTTP API + SSE | Reads and live updates |
+| Discovery | meta-discovery v1 (UDP multicast) | Locating meta-core and neighbours |
 | Reverse Proxy | nginx | Request routing |
-| Containerization | Docker | Deployment |
+| Containerization | Docker + supervisord | Deployment |
 
 ## Integration with MetaMesh
 
-Meta-Fuse is designed to work seamlessly with other MetaMesh services:
-
-- **meta-sort**: Provides metadata in KV database
-- **meta-stremio**: Can stream files exposed by meta-fuse
-- **meta-share**: Syncs metadata across P2P network
-
-### Connecting to meta-sort
-
-Ensure meta-sort is running and has processed files:
+- **meta-core**: Source of metadata (HTTP/SSE) and file bytes (WebDAV)
+- **meta-sort**: Produces the metadata meta-fuse organizes
+- **meta-stremio**: Reads the same metadata for streaming
 
 ```bash
-# Check meta-sort processing status
+# Is meta-sort producing records?
 curl -k https://metasort-dev.localhost:8180/api/processing/status
-
-# Verify Redis has metadata (via meta-core)
-docker exec metacore-app redis-cli scard "file:__index__"
-
-# Check meta:events stream has events
-docker exec metacore-app redis-cli xlen "meta:events"
+curl -k https://metacore-dev.localhost:8083/api/stats
 ```
-
-Meta-fuse will automatically discover the KV database through the shared lock file at `/meta-core/locks/kv-leader.info`.
 
 ## Documentation
 
-For detailed architecture documentation, see the `docs/` directory:
-
-- [VFS Rebuild Architecture](docs/vfs-rebuild-architecture.md) - How VFS state is built from Redis Streams
+- [VFS Rebuild Architecture](docs/vfs-rebuild-architecture.md) - How VFS state is built from the event stream
 - [Streaming Architecture](docs/streaming-architecture.md) - Event processing pipeline details
-- [API Reference](docs/api-reference.md) - Complete REST API documentation
+- [API Reference](docs/api-reference.md) - REST API documentation
+
+(These predate the HTTP/SSE migration in places; the code is authoritative.)
 
 ## License
 
-MIT License - See [LICENSE](LICENSE) for details.
+MIT (see `package.json`).
