@@ -6,7 +6,7 @@ Standalone virtual filesystem service that exposes metadata-organized content vi
 
 Meta-Fuse is a read-only process in the MetaMesh ecosystem that:
 
-1. **Locates meta-core over UDP** - meta-discovery v1 multicast announce (`239.255.77.1:9399`); no shared volume, no `REDIS_URL`
+1. **Locates meta-core over UDP** - beacon v2 multicast advertise (`239.255.99.1:9099`); no shared volume, no `REDIS_URL`
 2. **Reads metadata through meta-core's HTTP API** - `/meta/{hash}*` reads + SSE live updates on `/api/events/meta` (no direct Redis access)
 3. **Mounts virtual filesystem** - Rust-based FUSE driver creates an organized view of media files
 4. **Serves WebDAV** - Network-accessible, read-only file sharing for Windows/Mac/Linux clients, authenticated with per-device tokens
@@ -22,7 +22,7 @@ Meta-Fuse is a read-only process in the MetaMesh ecosystem that:
 │                                                                              │
 │   meta-core (owns Redis)                                                     │
 │   ┌──────────────────────────────────────────────┐                          │
-│   │  UDP announce (meta-discovery v1, /urls)     │                          │
+│   │  UDP announce (beacon v2, /urls)     │                          │
 │   │  HTTP API: /meta/{hash}*, /api/events/meta   │                          │
 │   │  WebDAV: /webdav  (file bytes, /files/...)   │                          │
 │   └──────────────────────────────────────────────┘                          │
@@ -91,9 +91,9 @@ In the dev stack and the CasaOS store app (`packages/MetaAppStore`, app `MetaFus
 └────────────────────────────────────────────────────────────────────────────┘
 ```
 
-### Locating meta-core (meta-discovery v1)
+### Locating meta-core (beacon v2)
 
-meta-core announces itself on UDP multicast `239.255.77.1:9399`, carrying its `/urls` payload. meta-fuse listens (and announces itself on the same group, so it shows up in every neighbour's nav menu):
+meta-core announces itself on UDP multicast `239.255.99.1:9099`, carrying its `/urls` payload. meta-fuse listens (and announces itself on the same group, so it shows up in every neighbour's nav menu):
 
 ```
 /urls payload (JSON):
@@ -107,14 +107,14 @@ meta-core announces itself on UDP multicast `239.255.77.1:9399`, carrying its `/
 }
 
 Discovery flow:
-1. meta-core announces role=core with its /urls payload
+1. meta-core advertises `metamesh.core` with its /urls payload (`data.urls`)
 2. meta-fuse picks it up (or uses META_CORE_URL and GET {url}/urls when pinned)
 3. meta-fuse reads metadata from apiUrl (/meta/{hash}*) and streams apiUrl/api/events/meta
 4. File bytes are fetched from http://<hostname>/webdav
 5. An announce carrying a different apiUrl triggers a reconnect
 ```
 
-**Note**: meta-fuse never owns storage. If meta-core still publishes a non-empty `redisUrl`, meta-fuse refuses to start (set `ALLOW_LEGACY_REDIS_URL=1` to downgrade that to a warning). Protocol spec: [service-discovery.md](../../docs/project-architecture/service-discovery.md).
+**Note**: meta-fuse never owns storage. If meta-core still publishes a non-empty `redisUrl`, meta-fuse refuses to start (set `ALLOW_LEGACY_REDIS_URL=1` to downgrade that to a warning). Protocol spec: [beacon-v2.md](../../docs/project-architecture/beacon-v2.md).
 
 ## Core Features
 
@@ -149,7 +149,7 @@ meta-fuse/
 │   │   ├── src/
 │   │   │   ├── api/APIServer.ts        # Fastify REST API
 │   │   │   ├── config/ConfigStorage.ts # Renaming-rules persistence
-│   │   │   ├── discovery/meshdisco.ts  # meta-discovery v1 (mirrored, see scripts/check-mirrors.sh)
+│   │   │   ├── discovery/meshdisco.ts  # beacon v2 (mirrored, see scripts/check-mirrors.sh)
 │   │   │   ├── kv/                     # Storage client (read-only)
 │   │   │   │   ├── IKVClient.ts        # Read-only interface
 │   │   │   │   ├── KVManager.ts        # meta-core location, connection management
@@ -309,7 +309,7 @@ The repo-root `docker-compose.yml` predates meta-core (it sets `REDIS_URL` and m
 | POST | `/api/webdav-tokens` | Create a token (`{ "label": "..." }`); plaintext returned once |
 | DELETE | `/api/webdav-tokens/:id` | Revoke a token |
 | **Service Discovery** |
-| GET | `/api/neighbors` | Services heard over meta-discovery v1 (nav menu) |
+| GET | `/api/neighbors` | Services heard over beacon v2 (nav menu) |
 
 ### Example Responses
 
@@ -545,7 +545,7 @@ curl -k https://metacore-dev.localhost:8083/api/stats   # does meta-core have re
 | FUSE Driver | Rust + fuser | Filesystem interface |
 | WebDAV | WsgiDAV (Python) + token DomainController | Network file sharing |
 | Metadata | meta-core HTTP API + SSE | Reads and live updates |
-| Discovery | meta-discovery v1 (UDP multicast) | Locating meta-core and neighbours |
+| Discovery | beacon v2 (UDP multicast) | Locating meta-core and neighbours |
 | Reverse Proxy | nginx | Request routing |
 | Containerization | Docker + supervisord | Deployment |
 

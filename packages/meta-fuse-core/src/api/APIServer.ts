@@ -91,7 +91,7 @@ export class APIServer {
     this.app.post('/api/fuse/rules/validate', this.handleValidateRule.bind(this));
     this.app.get('/api/fuse/rules/variables', this.handleGetVariables.bind(this));
 
-    // meta-discovery v1: neighbours heard over UDP, from this service's own
+    // beacon v2: neighbours heard over UDP, from this service's own
     // map — no meta-core needed, so the nav renders even when the core is down.
     this.app.get('/api/neighbors', this.handleNeighbors.bind(this));
 
@@ -134,16 +134,17 @@ export class APIServer {
   }
 
   /**
-   * meta-discovery v1 neighbours, served from this service's own UDP map.
+   * beacon v2 neighbours, served from this service's own UDP map.
    * `services` is an alias kept while older dashboard builds are around.
    */
-  private async handleNeighbors(_request: FastifyRequest, reply: FastifyReply): Promise<void> {
+  private async handleNeighbors(request: FastifyRequest, reply: FastifyReply): Promise<void> {
     const leaderClient = this.kvManager?.getLeaderClient();
     if (!leaderClient) {
       void reply.send({ current: 'meta-fuse', enabled: false, count: 0, neighbors: [] });
       return;
     }
-    const neighbors = leaderClient.getNeighbors();
+    const q = (request.query ?? {}) as { all?: string; cap?: string };
+    const neighbors = leaderClient.getNeighbors({ all: !!q.all, cap: q.cap || undefined });
     void reply.send({
       current: 'meta-fuse',
       enabled: true,
